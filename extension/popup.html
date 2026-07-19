@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Auto Bid</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div>
+          <h1>Auto Bid</h1>
+          <p id="sessionLabel">Not connected</p>
+        </div>
+        <button id="logoutButton" class="hidden" title="Log out">Log out</button>
+      </header>
+
+      <section class="section">
+        <label for="apiBase">API server</label>
+        <div class="row">
+          <input id="apiBase" type="url" placeholder="http://localhost:7003" />
+          <button id="saveSettingsButton">Save</button>
+        </div>
+      </section>
+
+      <section id="authSection" class="section hidden">
+        <div class="tabs">
+          <button id="loginTab" class="active">Login</button>
+          <button id="signupTab">Sign up</button>
+        </div>
+        <div id="signupNames" class="grid hidden">
+          <label>First name<input id="firstName" autocomplete="given-name" /></label>
+          <label>Last name<input id="lastName" autocomplete="family-name" /></label>
+        </div>
+        <label>Email<input id="email" type="email" autocomplete="email" /></label>
+        <label>Password<input id="password" type="password" autocomplete="current-password" /></label>
+        <button id="authButton" class="primary">Login</button>
+      </section>
+
+      <section id="profileSection" class="section">
+        <div class="row">
+          <select id="profileSelect"></select>
+          <button id="newProfileButton">New</button>
+        </div>
+
+        <label>Profile name<input id="profileName" /></label>
+        <div class="grid">
+          <label>First name<input data-static-key="first_name" /></label>
+          <label>Last name<input data-static-key="last_name" /></label>
+          <label>Full name<input data-static-key="full_name" /></label>
+          <label>Email<input data-static-key="email" type="email" /></label>
+          <label>Phone<input data-static-key="phone" /></label>
+          <label>Location<input data-static-key="location" /></label>
+          <label>City<input data-static-key="city" /></label>
+          <label>Country<input data-static-key="country" /></label>
+          <label>Languages<input data-static-key="languages" placeholder="e.g. English, Polish" /></label>
+          <label>LinkedIn<input data-static-key="linkedin" /></label>
+          <label>GitHub<input data-static-key="github" /></label>
+          <label>Portfolio<input data-static-key="portfolio" /></label>
+          <label>Website<input data-static-key="website" /></label>
+          <label>Expected salary / rate<input data-static-key="expected_rate" placeholder="e.g. 5500 EUR monthly" /></label>
+          <label>Work authorization<input data-static-key="work_authorization" /></label>
+          <label>Sponsorship<input data-static-key="sponsorship" /></label>
+          <label>Availability<input data-static-key="availability" /></label>
+          <label>Notice period<input data-static-key="notice_period" placeholder="e.g. Immediate, 2 weeks, 30 days" /></label>
+        </div>
+
+        <label>Resume / profile context<textarea id="resumeText" rows="6"></textarea></label>
+        <div class="grid">
+          <label>Tone<input id="tone" placeholder="direct, confident, concise" /></label>
+          <label>Bid style<input id="bidStyle" placeholder="short proposal, detailed proposal" /></label>
+        </div>
+
+        <div class="row">
+          <button id="saveProfileButton" class="primary">Save profile</button>
+          <button id="deleteProfileButton" class="danger">Delete</button>
+        </div>
+      </section>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

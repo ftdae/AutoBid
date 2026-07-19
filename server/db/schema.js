@@ -1,0 +1,84 @@
+export async function ensureSchema(pool) {
+  await pool.query(`
+    create table if not exists auto_bid_users (
+      id text primary key,
+      first_name text not null,
+      last_name text not null,
+      email text not null unique,
+      password text not null,
+      timezone text not null default 'UTC',
+      active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    create table if not exists auto_bid_profiles (
+      id text primary key,
+      user_id text not null references auto_bid_users(id) on delete cascade,
+      name text not null,
+      static_fields jsonb not null default '{}'::jsonb,
+      resume_text text not null default '',
+      preferences jsonb not null default '{}'::jsonb,
+      profile_version integer not null default 1,
+      active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    create table if not exists auto_bid_questions (
+      id text primary key,
+      question_hash text not null unique,
+      domain text not null,
+      url_pattern text,
+      normalized_label text not null,
+      field_type text not null,
+      options_json jsonb,
+      required boolean not null default false,
+      cache_scope text not null default 'profile_job',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      check (cache_scope in ('global', 'profile', 'profile_job'))
+    );
+
+    create table if not exists auto_bid_answer_cache (
+      id text primary key,
+      question_hash text not null references auto_bid_questions(question_hash) on delete cascade,
+      cache_scope text not null,
+      profile_id text references auto_bid_profiles(id) on delete cascade,
+      profile_version integer,
+      job_hash text,
+      answer text not null,
+      confidence numeric(5, 4),
+      source text not null default 'ai',
+      expires_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      check (cache_scope in ('global', 'profile', 'profile_job')),
+      check (source in ('ai', 'user', 'static'))
+    );
+
+    create table if not exists auto_bid_application_drafts (
+      id text primary key,
+      user_id text not null references auto_bid_users(id) on delete cascade,
+      profile_id text references auto_bid_profiles(id) on delete set null,
+      domain text not null,
+      url text not null,
+      normalized_url text,
+      job_hash text,
+      form_hash text,
+      field_snapshot jsonb not null,
+      answers_json jsonb not null,
+      status text not null default 'draft',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      check (status in ('draft', 'filled', 'submitted'))
+    );
+
+    create index if not exists auto_bid_profiles_user_active_idx on auto_bid_profiles(user_id, active);
+    create index if not exists auto_bid_questions_domain_scope_idx on auto_bid_questions(domain, cache_scope);
+    create index if not exists auto_bid_answer_cache_question_scope_idx on auto_bid_answer_cache(question_hash, cache_scope, created_at desc);
+    create index if not exists auto_bid_answer_cache_profile_idx on auto_bid_answer_cache(profile_id, profile_version);
+    create index if not exists auto_bid_drafts_user_created_idx on auto_bid_application_drafts(user_id, created_at desc);
+    create index if not exists auto_bid_drafts_profile_created_idx on auto_bid_application_drafts(profile_id, created_at desc);
+  `);
+}

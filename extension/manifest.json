@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Auto Bid Assistant",
+  "version": "0.1.0",
+  "description": "Detect required job application fields, reuse cached answers, and fill reviewed drafts from selected profiles.",
+  "permissions": ["storage", "activeTab", "scripting", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Auto Bid"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "trigger-auto-bid": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Analyze the current application form"
+    }
+  }
+}
