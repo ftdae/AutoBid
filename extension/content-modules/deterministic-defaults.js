@@ -37,13 +37,12 @@
       const localFilledIds = new Set();
 
       for (const field of fields) {
-        if (filledIds.has(field.id)) continue;
-
         const controls = getControlsByFieldId(field.id);
         if (controls.length === 0) continue;
 
         const fallback = getDeterministicDefault(field, controls);
         if (!fallback) continue;
+        if (filledIds.has(field.id) && !shouldForceDeterministicDefault(field, controls, fallback)) continue;
 
         const current = getCurrentChoiceSummary(controls);
         const alreadyApplied = getControlType(controls[0]) === "range"
@@ -54,12 +53,18 @@
           continue;
         }
 
-        const selected = await setDeterministicDefaultValue(controls, fallback.value);
+        const candidateValues = uniqueValues([fallback.value, ...(fallback.values || [])]);
+        let selected = false;
+        for (const value of candidateValues) {
+          selected = await setDeterministicDefaultValue(controls, value, fallback);
+          if (selected) break;
+        }
         traceAutoBid("default:applied", {
           field_id: field.id,
           label: field.label,
           reason: fallback.reason,
           value: fallback.value,
+          candidates: candidateValues,
           selected,
           current: getCurrentChoiceSummary(controls)
         });
@@ -80,12 +85,17 @@
         return { value: "PostgreSQL", reason: "database-default" };
       }
 
+      if (isAuthorizationSupportRequiredChoiceField(field, controls)) {
+        return { value: "No", reason: "authorization-support-not-required" };
+      }
+
       if (isAvailabilityDateField(field, controls)) {
         return { value: formatDateForControl(getNextMondayDate(), controls[0], field), reason: "next-monday" };
       }
 
-      if (isExperienceValueField(field, controls)) {
-        return { value: getDefaultExperienceYears(controls[0]), reason: "experience-years" };
+      const experienceDefault = getExperienceYearsDefault(field, controls);
+      if (experienceDefault) {
+        return experienceDefault;
       }
 
       return null;
@@ -99,6 +109,30 @@
         options.some((option) => /(postgresql|postgres|postgre sql)/.test(option));
     }
 
+    function isAuthorizationSupportRequiredChoiceField(field, controls) {
+      if (!isChoiceFieldType(field.type)) return false;
+      if (!hasYesNoOptions(field.options)) return false;
+      const label = getFieldContextLabel(field, controls?.[0]);
+      return isAuthorizationSupportRequiredText(label);
+    }
+
+    function isAuthorizationSupportRequiredText(value) {
+      const text = normalize(value);
+      if (!text) return false;
+      if (/(authorized|authorised|eligible|legally).*(work|employ)|(work|employ).*(authorized|authorised|eligible|legally)/.test(text)) return false;
+      if (/without.{0,80}(sponsor|sponsorship|visa|work permit|support)/.test(text)) return false;
+      const supportNoun = /(authorization|authorisation|sponsor|sponsorship|visa|work permit|work authorization support|work authorisation support)/;
+      const requireVerb = /(require|need|needs|needed|seek|seeking|request|support|depend|dependent)/;
+      return (requireVerb.test(text) && supportNoun.test(text)) ||
+        /(now|future).{0,80}(authorization|authorisation|sponsor|sponsorship|visa|work permit)/.test(text) ||
+        /(authorization|authorisation|sponsor|sponsorship|visa|work permit).{0,80}(now|future|support|required|needed)/.test(text);
+    }
+
+    function hasYesNoOptions(options) {
+      const normalized = (options || []).map(normalize);
+      return normalized.includes("yes") && normalized.includes("no");
+    }
+
     function isAvailabilityDateField(field, controls) {
       const control = controls?.[0];
       const type = getControlType(control);
@@ -107,12 +141,132 @@
       return /(date available|available date|available start date|earliest.*start|start date|when.*start|availability date)/.test(label);
     }
 
+    function getExperienceYearsDefault(field, controls) {
+      const control = controls?.[0];
+      const type = getControlType(control);
+      const label = getFieldContextLabel(field, control);
+      if (!isExperienceYearsLabel(label)) return null;
+
+      const kind = getExperienceYearsKind(label);
+      const targetYears = getExperienceDefaultTargetYears(kind);
+      const reason = `experience-years-${kind}`;
+
+      if (isChoiceFieldType(type)) {
+        const bestOption = findBestExperienceYearsOption(field.options || [], targetYears);
+        const values = buildExperienceChoiceValueCandidates(targetYears, bestOption);
+        return {
+          value: values[0],
+          values,
+          reason,
+          target_years: targetYears
+        };
+      }
+
+      if (["range", "number", "text"].includes(type)) {
+        const textEntryTargetYears = getTextEntryExperienceDefaultTargetYears(label, kind);
+        return { value: getDefaultExperienceYears(control, textEntryTargetYears), reason, target_years: textEntryTargetYears };
+      }
+
+      return null;
+    }
+
     function isExperienceValueField(field, controls) {
       const control = controls?.[0];
       const type = getControlType(control);
       if (!["range", "number", "text"].includes(type)) return false;
       const label = getFieldContextLabel(field, control);
+      return isExperienceYearsLabel(label);
+    }
+
+    function isExperienceYearsLabel(label) {
       return /(how many.*years.*experience|years.*professional.*experience|years.*experience|experience.*years)/.test(label);
+    }
+
+    function getExperienceYearsKind(label) {
+      const text = normalize(label);
+      if (isDomainExperienceText(text)) return "domain";
+      if (isTechSkillExperienceText(text)) return "tech";
+      return "general";
+    }
+
+    function getExperienceDefaultTargetYears(kind) {
+      if (kind === "domain") return 7;
+      if (kind === "tech") return 9;
+      return 10;
+    }
+
+    function getTextEntryExperienceDefaultTargetYears(_label, _kind) {
+      return 7;
+    }
+
+    function isDomainExperienceText(text) {
+      return /(backend development|frontend development|front end development|full stack development|software development|web development|mobile development|domain|industry|sector|e commerce|ecommerce|commerce|d2c|direct to consumer|b2b|b2c|fintech|financial tech|banking|finance|payments|igaming|gaming|retail|marketplace|healthcare|health care|medtech|edtech|insurtech|proptech|martech|adtech|travel|hospitality|logistics|media|saas)/.test(text);
+    }
+
+    function isTechSkillExperienceText(text) {
+      return /(python|react|node|node js|nestjs|nest js|next js|javascript|typescript|java\b|kotlin|spring|c sharp|c#|\.net|dotnet|php|ruby|rails|go\b|golang|rust|scala|aws|azure|gcp|cloud|api|graphql|rest|sql|postgres|postgresql|mysql|mongodb|redis|docker|kubernetes|k8s|terraform|angular|vue|svelte|frontend|front end|mobile|android|ios|react native)/.test(text);
+    }
+
+    function findBestExperienceYearsOption(options, targetYears) {
+      const scored = (options || [])
+        .map((option) => ({ option: String(option || "").trim(), score: scoreExperienceYearsOption(option, targetYears) }))
+        .filter((item) => item.option && item.score > 0)
+        .sort((left, right) => right.score - left.score);
+      return scored[0]?.option || "";
+    }
+
+    function buildExperienceChoiceValueCandidates(targetYears, bestOption = "") {
+      const target = String(targetYears);
+      const candidates = [bestOption, target, `${target} years`];
+
+      if (targetYears === 7) {
+        candidates.push("7-9", "6-7", "5-7", "7+", "4-6");
+      } else if (targetYears === 9) {
+        candidates.push("7-9", "8-9", "8+", "9+", "6-9");
+      } else {
+        candidates.push("10+", "10 years", "10 or more", "8-10", "7-10");
+      }
+
+      return uniqueValues(candidates);
+    }
+
+    function scoreExperienceYearsOption(option, targetYears) {
+      const range = parseExperienceYearsOption(option);
+      if (!range) return 0;
+
+      const span = Number.isFinite(range.max) ? Math.max(0, range.max - range.min) : 8;
+      let score = 0;
+
+      if (range.min <= targetYears && targetYears <= range.max) {
+        score = 1000 - span * 8;
+      } else if (Number.isFinite(range.max) && range.max <= targetYears) {
+        score = 820 + range.max * 12 - (targetYears - range.max) * 24;
+      } else if (range.min > targetYears) {
+        score = 420 - (range.min - targetYears) * 45;
+      }
+
+      if (targetYears < 10 && range.min >= 10) score -= 260;
+      return score;
+    }
+
+    function parseExperienceYearsOption(option) {
+      const text = normalize(option);
+      if (!text || /^(select|choose|please select|placeholder|n a|not applicable)$/.test(text)) return null;
+      const numbers = text.match(/\d+(?:\.\d+)?/g)?.map(Number).filter(Number.isFinite) || [];
+      if (numbers.length === 0) return null;
+
+      if (/less than|under|below|fewer than|up to|at most/.test(text)) {
+        return { min: 0, max: numbers[0] };
+      }
+
+      const hasPlus = /\+|plus|or more|more than|over|above|greater than|at least/.test(String(option || "").toLowerCase()) ||
+        /or more|more than|over|above|greater than|at least/.test(text);
+      if (numbers.length >= 2) {
+        return { min: Math.min(numbers[0], numbers[1]), max: Math.max(numbers[0], numbers[1]) };
+      }
+
+      if (hasPlus) return { min: numbers[0], max: Infinity };
+      return { min: numbers[0], max: numbers[0] };
     }
 
     function getFieldContextLabel(field, control) {
@@ -126,7 +280,7 @@
       ].filter(Boolean).join(" "));
     }
 
-    async function setDeterministicDefaultValue(controls, value) {
+    async function setDeterministicDefaultValue(controls, value, fallback = null) {
       const first = controls[0];
       const type = getControlType(first);
 
@@ -134,7 +288,11 @@
         return setRangeValueWithVisibleEditor(first, value);
       }
 
-      if (["number", "date"].includes(type)) {
+      if (type === "number" || (type === "text" && String(fallback?.reason || "").startsWith("experience-years-"))) {
+        return setNumberInputDefaultValue(first, value, controls);
+      }
+
+      if (type === "date") {
         await scrollElementIntoView(first, "center");
         setNativeValue(first, value);
         dispatchInput(first);
@@ -143,6 +301,43 @@
       }
 
       return setControlsValue(controls, value);
+    }
+
+    function shouldForceDeterministicDefault(field, controls, fallback) {
+      if (!fallback || !isExperienceValueField(field, controls)) return false;
+      const current = getCurrentChoiceSummary(controls) || field?.value || "";
+      return /^(0|0\.0+|0\s*(?:years?|yrs?)?)$/i.test(String(current || "").trim());
+    }
+
+    async function setNumberInputDefaultValue(input, value, controls) {
+      await scrollElementIntoView(input, "center");
+
+      if (!await nativeClickElement(input)) {
+        dispatchRealisticMouseClick(input);
+      }
+      input.focus?.();
+      await sleep(140);
+
+      clearTextEntryValue(input);
+      await sleep(80);
+
+      if (await nativeTypeText(value, false)) {
+        dispatchInput(input);
+        input.blur?.();
+        await sleep(500);
+        if (normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value)) return true;
+      }
+
+      if (replaceTextEntryValue(input, value)) {
+        await sleep(500);
+        if (normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value)) return true;
+      }
+
+      setNativeValue(input, value);
+      dispatchInput(input);
+      input.blur?.();
+      await sleep(500);
+      return normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value);
     }
 
     async function setRangeValueWithVisibleEditor(control, value) {
@@ -197,7 +392,7 @@
       const tag = element.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") {
         element.focus?.();
-        element.select?.();
+        safelySelectTextEntry(element);
         setNativeValue(element, value);
         dispatchInput(element);
         element.blur?.();
@@ -220,9 +415,35 @@
       return false;
     }
 
-    async function nativeTypeText(value) {
+    function clearTextEntryValue(element) {
+      if (!element) return false;
+      element.focus?.();
+      safelySelectTextEntry(element);
+      setNativeValue(element, "");
+      dispatchInput(element);
+      return String(element.value || "") === "";
+    }
+
+    function safelySelectTextEntry(element) {
       try {
-        const result = await send("NATIVE_TYPE", { text: String(value), commit: true });
+        element.select?.();
+        return true;
+      } catch (_error) {
+        // Number inputs reject select() in Chromium; native Ctrl+A still selects them.
+      }
+
+      try {
+        const length = String(element.value || "").length;
+        element.setSelectionRange?.(0, length);
+        return true;
+      } catch (_error) {
+        return false;
+      }
+    }
+
+    async function nativeTypeText(value, commit = true) {
+      try {
+        const result = await send("NATIVE_TYPE", { text: String(value), commit: commit });
         return result?.typed === true;
       } catch (error) {
         traceAutoBid("native-type:failed", { message: error.message || String(error) });
@@ -314,11 +535,11 @@
       return cleanLabel(ownText || (element.children.length === 0 ? element.textContent : ""));
     }
 
-    function getDefaultExperienceYears(control) {
+    function getDefaultExperienceYears(control, preferredYears = 10) {
       const min = parseFiniteNumber(control?.min, 0);
       const max = parseFiniteNumber(control?.getAttribute?.("max") || control?.max, NaN);
       const step = parseFiniteNumber(control?.step, 1);
-      let value = Number.isFinite(max) && max > min ? max : 10;
+      let value = preferredYears;
 
       if (value < min) value = min;
       if (Number.isFinite(max) && value > max) value = max;
@@ -330,12 +551,17 @@
     }
 
     function parseFiniteNumber(value, fallback) {
+      if (value == null || String(value).trim() === "") return fallback;
       const number = Number(value);
       return Number.isFinite(number) ? number : fallback;
     }
 
     function formatNumberValue(value) {
       return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+    }
+
+    function uniqueValues(values) {
+      return Array.from(new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean)));
     }
 
     function getNextMondayDate(now = new Date()) {

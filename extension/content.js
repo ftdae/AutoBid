@@ -38,7 +38,58 @@ const EU_COUNTRY_NAMES = new Set([
 const DROPDOWN_OPEN_TIMEOUT_MS = 2200;
 const DROPDOWN_SELECT_TIMEOUT_MS = 2200;
 const DROPDOWN_SETTLE_MS = 450;
+const LOCATION_AUTOCOMPLETE_WAIT_MS = 2000;
+const MAX_FIELD_FILL_ATTEMPTS = 3;
+const SHEET_ANSWER_FIRST_WAIT_MS = 10000;
+const SHEET_ANSWER_RETRY_ATTEMPTS = 3;
+const SHEET_ANSWER_RETRY_MS = 10000;
+const RUNTIME_GPT_ANSWER_TIMEOUT_MS = 90000;
+const RUNTIME_GPT_ANSWER_POLL_MS = 1000;
+const SHEET_CONTEXT_TIMEOUT_MS = 5000;
+const RESUME_ATTACH_TIMEOUT_MS = 30000;
+const RESUME_FILE_INPUT_WAIT_MS = 2500;
+const RESUME_FILE_INPUT_RETRY_MS = 250;
+const RESUME_SERVER_CONFIRM_TIMEOUT_MS = 6000;
 const CHOICE_FIELD_TYPES = ["select", "radio", "combobox", "button-group"];
+const PHONE_DIAL_CODES_BY_COUNTRY = {
+  albania: "+355",
+  austria: "+43",
+  belgium: "+32",
+  bulgaria: "+359",
+  canada: "+1",
+  croatia: "+385",
+  cyprus: "+357",
+  "czech republic": "+420",
+  czechia: "+420",
+  denmark: "+45",
+  estonia: "+372",
+  finland: "+358",
+  france: "+33",
+  germany: "+49",
+  greece: "+30",
+  hungary: "+36",
+  ireland: "+353",
+  italy: "+39",
+  latvia: "+371",
+  lithuania: "+370",
+  luxembourg: "+352",
+  malta: "+356",
+  netherlands: "+31",
+  norway: "+47",
+  poland: "+48",
+  portugal: "+351",
+  romania: "+40",
+  slovakia: "+421",
+  slovenia: "+386",
+  spain: "+34",
+  sweden: "+46",
+  switzerland: "+41",
+  ukraine: "+380",
+  "united kingdom": "+44",
+  uk: "+44",
+  "united states": "+1",
+  usa: "+1"
+};
 const LANGUAGE_ALIASES = [
   ["english", ["english"]],
   ["ukrainian", ["ukrainian"]],
@@ -90,6 +141,18 @@ let autoBidRunning = false;
 let lastMousePoint = null;
 let lastNativeClickError = null;
 let autoBidTrace = [];
+let autoBidRunId = "";
+let autoBidRunStartedAt = "";
+let tracePublishTimer = null;
+const runtimeGptSourceFields = new Map();
+const runtimeGptAnswersByRequest = new Map();
+const runtimeGptApplyPromises = new Map();
+const generatedAnswerFillAttempts = new Map();
+const atsAdapters = window.AutoBidAtsAdapters?.create({
+  queryAll,
+  isVisible,
+  cleanText: cleanLabel
+}) || null;
 
 function isActiveContentInstance() {
   return window.__autoBidActiveContentInstance === AUTO_BID_INSTANCE_ID;
@@ -105,7 +168,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "AUTO_BID_TRIGGER") {
     runAutoBid();
     sendResponse?.({ ok: true });
+    return false;
   }
+  if (message?.type === "AUTO_BID_GPT_ANSWERS_READY") {
+    const payload = message.payload || {};
+    applyPushedRuntimeGptAnswers(payload)
+      .then((result) => sendResponse?.({ ok: true, ...result }))
+      .catch((error) => {
+        traceAutoBid("runtime-gpt:push-apply-error", {
+          request_id: payload.request_id || payload.requestId || "",
+          message: error.message || String(error)
+        });
+        sendResponse?.({ ok: false, settled: false, error: error.message || String(error) });
+      });
+    return true;
+  }
+  return false;
 });
 
 runAutoBid();
@@ -113,16 +191,25 @@ runAutoBid();
 async function runAutoBid() {
   if (!isActiveContentInstance() || autoBidRunning) return;
   autoBidRunning = true;
+  send("AUTOBID_AUTOFILL_STATE", { running: true, url: location.href }).catch(() => {});
   lastNativeClickError = null;
   resetTrace();
-  traceAutoBid("run:start", { url: location.href, title: document.title, frame: getFrameScope() });
+  traceAutoBid("run:start", {
+    url: location.href,
+    title: document.title,
+    frame: getFrameScope(),
+    ats: atsAdapters?.describe?.() || { id: "common", name: "Common form" }
+  });
   showStatus("Auto Bid is filling this page...", "success");
+  await closeOpenChoiceMenus();
 
-  const fields = collectFields();
+  let fields = collectFields();
   traceAutoBid("fields:collected", {
     count: fields.length,
     fields: fields.map((field) => ({
       id: field.id,
+      question: field.question || "",
+      option: field.option || "",
       label: field.label,
       type: field.type,
       required: field.required,
@@ -137,67 +224,299 @@ async function runAutoBid() {
     flushTrace();
     showStatus(embeddedFrames ? "Checking embedded application frames..." : "No fillable fields found.", embeddedFrames ? "success" : "error");
     autoBidRunning = false;
+    await send("AUTOBID_AUTOFILL_STATE", { running: false, reason: "no-fields", url: location.href }).catch(() => {});
     return;
   }
 
   try {
-    const hoverResult = await applyHoveredDropdownSelection(fields);
-    const prefillResult = await applyPositiveDropdownFallbacks(fields, hoverResult.filledIds);
-    const checkboxResult = await applyPositiveCheckboxFallbacks(fields, new Set([...hoverResult.filledIds, ...prefillResult.filledIds]));
-    const defaultResult = await applyDeterministicDefaults(fields, new Set([...hoverResult.filledIds, ...prefillResult.filledIds, ...checkboxResult.filledIds]));
-    const staticFallbackResult = await applyProfileStaticFallbacks(fields, new Set([...hoverResult.filledIds, ...prefillResult.filledIds, ...checkboxResult.filledIds, ...defaultResult.filledIds]));
-    const languageChoiceResult = await applyLanguageChoiceAnswers(fields, new Set([...hoverResult.filledIds, ...prefillResult.filledIds, ...checkboxResult.filledIds, ...defaultResult.filledIds, ...staticFallbackResult.filledIds]));
-    let data;
-    try {
-      data = await send("ASSIST", {
-        page: collectPageContext(),
-        fields
-      });
-    } catch (error) {
-      traceAutoBid("assist:error", { message: error.message || String(error) });
-      if (!staticFallbackResult.filled && !checkboxResult.filled && !defaultResult.filled && !languageChoiceResult.filled) throw error;
-      data = {
-        answers: [],
-        warnings: [error.message || String(error)],
-        cache: null
-      };
-    }
-    const answers = data.answers || [];
-    traceAutoBid("assist:received", {
-      answers: answers.length,
-      answer_fields: answers.map((answer) => ({
-        field_id: answer.field_id,
-        source: answer.source || "",
-        cache_scope: answer.cache_scope || "",
-        value: shortText(answer.value || "")
-      })),
-      warnings: data.warnings || [],
-      cache: data.cache || null,
-      static_merge: data.static_merge || null
+    const initiallyFilledIds = getCurrentlyFilledFieldIds(fields);
+    traceAutoBid("fields:already-filled", { count: initiallyFilledIds.size, field_ids: Array.from(initiallyFilledIds) });
+
+    const staticFallbackResult = await runStep("static-profile", () => applyProfileStaticFallbacks(fields, initiallyFilledIds), emptyFillResult());
+    const locallyFilledIds = new Set([...initiallyFilledIds, ...staticFallbackResult.filledIds]);
+    const localFallbackResult = await runStep("local-fallbacks", () => applyLocalGeneratedFallbacks(fields, locallyFilledIds), emptyFillResult());
+    fields = collectFields();
+    const localAnswerIds = getCurrentlyFilledFieldIds(fields);
+    traceAutoBid("fields:refreshed-after-local", {
+      count: fields.length,
+      filled: localAnswerIds.size
     });
-    (data.warnings || []).forEach((message) => {
-      traceAutoBid("assist:warning", { message });
+    const resumeResultPromise = runStepWithTimeout("resume-upload", attachResumeFromSheet, emptyResumeResult(), RESUME_ATTACH_TIMEOUT_MS);
+
+    traceAutoBid("ai:router-order", {
+      first: "chatgpt-extension",
+      second: "openai",
+      candidates: getGeneratedAnswerCandidateFields(fields, localAnswerIds).length
     });
-    const dropdownFilledIds = new Set([...hoverResult.filledIds, ...prefillResult.filledIds, ...checkboxResult.filledIds, ...defaultResult.filledIds, ...staticFallbackResult.filledIds, ...languageChoiceResult.filledIds]);
-    const result = await applyAnswers(answers, dropdownFilledIds);
-    const residenceResult = await applyResidenceAnswers(fields, answers, new Set([...dropdownFilledIds, ...result.filledIds]));
-    const locationChoiceResult = await applyBasedInLocationAnswers(fields, answers, new Set([...dropdownFilledIds, ...result.filledIds, ...residenceResult.filledIds]));
-    const alreadyFilled = new Set([...dropdownFilledIds, ...result.filledIds, ...residenceResult.filledIds, ...locationChoiceResult.filledIds, ...checkboxResult.filledIds, ...defaultResult.filledIds, ...staticFallbackResult.filledIds, ...languageChoiceResult.filledIds]);
-    const fallbackResult = await applyPositiveDropdownFallbacks(fields, alreadyFilled);
-    if (data.draft_id) {
-      send("DRAFT_STATUS", null, { draftId: data.draft_id, status: "filled" }).catch(() => {});
-    }
-    const filled = hoverResult.filled + prefillResult.filled + checkboxResult.filled + defaultResult.filled + languageChoiceResult.filled + result.filled + residenceResult.filled + locationChoiceResult.filled + staticFallbackResult.filled + fallbackResult.filled;
-    const missed = hoverResult.missed + prefillResult.missed + checkboxResult.missed + defaultResult.missed + languageChoiceResult.missed + result.missed + residenceResult.missed + locationChoiceResult.missed + staticFallbackResult.missed + fallbackResult.missed;
-    traceAutoBid("run:complete", { filled, missed });
-    showStatus(`Filled ${filled} fields. ${missed} skipped.`, filled ? "success" : "error");
+    const runtimeGptResult = await runStep(
+      "chatgpt-first-provider",
+      () => applyRuntimeGptAnswerExchange(fields, localAnswerIds),
+      emptySheetResult()
+    );
+    fields = collectFields();
+    const afterRuntimeGptIds = getCurrentlyFilledFieldIds(fields);
+    traceAutoBid("fields:refreshed-after-chatgpt", {
+      count: fields.length,
+      filled: afterRuntimeGptIds.size,
+      chatgpt_filled: runtimeGptResult.filled,
+      chatgpt_pending: runtimeGptResult.pending
+    });
+    const openAiResult = await runStep(
+      "openai-second-provider",
+      () => applyDirectAiAnswers(fields, afterRuntimeGptIds),
+      emptyFillResult()
+    );
+    fields = collectFields();
+    traceAutoBid("fields:refreshed-after-openai", {
+      count: fields.length,
+      filled: getCurrentlyFilledFieldIds(fields).size,
+      openai_filled: openAiResult.filled,
+      unresolved_required: openAiResult.missed
+    });
+    const resumeResult = await resumeResultPromise;
+    fields = collectFields();
+    const postGeneratedFilledIds = getCurrentlyFilledFieldIds(fields);
+    const profileReconcileResult = await runStep(
+      "profile-reconcile",
+      () => applyProfileStaticFallbacks(fields, postGeneratedFilledIds),
+      emptyFillResult()
+    );
+    const runtimeGptReconcileResult = emptyFillResult();
+    fields = collectFields();
+    const finalDefaultIds = getCurrentlyFilledFieldIds(fields);
+    const finalDefaultResult = await runStep("final-deterministic-defaults", () => applyDeterministicDefaults(fields, finalDefaultIds), emptyFillResult());
+    const submitResult = await maybeAutoSubmitApplication(fields, {
+      filled: runtimeGptResult.filled + openAiResult.filled + finalDefaultResult.filled,
+      pending: runtimeGptResult.pending
+    }, resumeResult);
+    const filled = staticFallbackResult.filled + localFallbackResult.filled + runtimeGptResult.filled + openAiResult.filled + profileReconcileResult.filled + runtimeGptReconcileResult.filled + finalDefaultResult.filled + resumeResult.filled;
+    const missed = getMissingRequiredFields(collectFields()).length;
+    traceAutoBid("run:complete", { filled, missed, runtime_gpt: runtimeGptResult, openai: openAiResult, profile_reconcile: profileReconcileResult, runtime_gpt_reconcile: runtimeGptReconcileResult, final_defaults: finalDefaultResult, resume: resumeResult, submit: submitResult });
+    showStatus(submitResult.clicked ? "Filled and submitted application." : `Filled ${filled} fields. ${missed} skipped.`, filled || resumeResult.filled ? "success" : "error");
   } catch (error) {
     traceAutoBid("run:error", { message: error.message || String(error) });
     showStatus(error.message || String(error), "error");
   } finally {
     flushTrace();
     autoBidRunning = false;
+    await send("AUTOBID_AUTOFILL_STATE", { running: false, reason: "run-finished", url: location.href }).catch(() => {});
   }
+}
+
+async function runStep(name, runner, fallback) {
+  try {
+    return await runner();
+  } catch (error) {
+    traceAutoBid(`${name}:error`, { message: error.message || String(error) });
+    return fallback;
+  }
+}
+
+async function runStepWithTimeout(name, runner, fallback, timeoutMs) {
+  try {
+    return await promiseWithTimeout(runner(), timeoutMs, `${name} timed out after ${timeoutMs}ms`);
+  } catch (error) {
+    traceAutoBid(`${name}:error`, { message: error.message || String(error), timeout_ms: timeoutMs });
+    return fallback;
+  }
+}
+
+function promiseWithTimeout(promise, timeoutMs, message) {
+  let timeoutId = null;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_resolve, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+  });
+}
+
+function emptyFillResult() {
+  return { filled: 0, missed: 0, filledIds: new Set(), missedIds: new Set() };
+}
+
+function emptySheetResult() {
+  return { ...emptyFillResult(), pending: 0 };
+}
+
+function emptyResumeResult() {
+  return { filled: 0, missed: 0, reason: "skipped-after-error" };
+}
+
+async function applyLocalGeneratedFallbacks(fields, filledIds) {
+  const activeFilledIds = new Set(filledIds);
+  const localFilledIds = new Set();
+  let filled = 0;
+  let missed = 0;
+
+  const runLocalPass = async (name, runner) => {
+    let result;
+    try {
+      result = await runner(fields, activeFilledIds);
+    } catch (error) {
+      traceAutoBid(`local:${name}:error`, { message: error.message || String(error) });
+      return;
+    }
+    result.filledIds?.forEach((fieldId) => {
+      activeFilledIds.add(fieldId);
+      localFilledIds.add(fieldId);
+    });
+    filled += result.filled || 0;
+    missed += result.missed || 0;
+    traceAutoBid(`local:${name}`, {
+      filled: result.filled || 0,
+      missed: result.missed || 0,
+      field_ids: Array.from(result.filledIds || [])
+    });
+  };
+
+  await runLocalPass("language-choice", applyLanguageChoiceAnswers);
+  await runLocalPass("outlook-verification", applyOutlookVerificationAnswers);
+  await runLocalPass("based-in-location", (items, ids) => applyBasedInLocationAnswers(items, [], ids));
+  await runLocalPass("referral-source", applyReferralSourceAnswers);
+  await runLocalPass("consent-choice", applyConsentChoiceAnswers);
+  await runLocalPass("deterministic-defaults", applyDeterministicDefaults);
+  await runLocalPass("positive-dropdowns", applyPositiveDropdownFallbacks);
+  await runLocalPass("positive-checkboxes", applyPositiveCheckboxFallbacks);
+
+  return { filled, missed, filledIds: localFilledIds };
+}
+
+async function applyOutlookVerificationAnswers(fields, filledIds) {
+  const candidates = fields.filter((field) =>
+    field.required &&
+    !filledIds.has(field.id) &&
+    !hasFieldCurrentValue(field) &&
+    isOutlookVerificationCodeField(field)
+  );
+  const result = { filled: 0, missed: 0, filledIds: new Set(), missedIds: new Set() };
+  if (candidates.length === 0) return result;
+
+  let verification;
+  try {
+    verification = await send("OUTLOOK_FIND_VERIFICATION", {
+      domain: location.hostname.replace(/^www\./, ""),
+      title: document.title || "",
+      top: 10
+    });
+  } catch (error) {
+    traceAutoBid("outlook-verification:unavailable", { message: error.message || String(error) });
+    return result;
+  }
+  if (!verification?.code) {
+    traceAutoBid("outlook-verification:no-code", { candidates: candidates.map((field) => field.id) });
+    return result;
+  }
+
+  for (const field of candidates) {
+    const controls = getControlsByFieldId(field.id);
+    const applied = controls.length > 0 && await setControlsValue(controls, verification.code, field);
+    if (applied) {
+      result.filled += 1;
+      result.filledIds.add(field.id);
+      traceAutoBid("outlook-verification:applied", {
+        field_id: field.id,
+        message_id: verification.message?.id || ""
+      });
+    } else {
+      result.missed += 1;
+      result.missedIds.add(field.id);
+    }
+  }
+  if (result.filled > 0 && verification.message?.id) {
+    send("OUTLOOK_MARK_READ", { messageId: verification.message.id }).catch(() => {});
+  }
+  return result;
+}
+
+function isOutlookVerificationCodeField(field) {
+  const text = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (/(postal|zip|country|dial|phone|promo|coupon|referral)/.test(text)) return false;
+  return /(verification|security|confirmation|one time|otp|passcode|authentication)\s*(code|pin|number)?/.test(text) ||
+    /\b(code|pin)\b/.test(text) && /(email|account|application|verify|confirm)/.test(text);
+}
+
+async function applyDirectAiAnswers(fields, filledIds) {
+  const localFilledIds = new Set();
+  const candidateFields = getGeneratedAnswerCandidateFields(fields, filledIds);
+  if (candidateFields.length === 0) {
+    traceAutoBid("ai:no-candidates", {
+      fields: fields.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        type: field.type,
+        required: field.required,
+        reason: getGeneratedAnswerCandidateSkipReason(field, filledIds)
+      }))
+    });
+    return { filled: 0, missed: 0, filledIds: localFilledIds };
+  }
+
+  await hydrateGeneratedChoiceOptions(candidateFields);
+
+  traceAutoBid("ai:candidates", {
+    count: candidateFields.length,
+    fields: candidateFields.map((field) => ({
+      field_id: field.id,
+      label: field.label,
+      type: field.type,
+      options: field.options || []
+    }))
+  });
+
+  let data;
+  try {
+    data = await send("ASSIST", {
+      page: collectPageContext(),
+      fields: candidateFields
+    });
+  } catch (error) {
+    traceAutoBid("ai:error", { message: error.message || String(error) });
+    return {
+      filled: 0,
+      missed: candidateFields.length,
+      filledIds: localFilledIds,
+      missedIds: new Set(candidateFields.map((field) => field.id))
+    };
+  }
+
+  const candidateIds = new Set(candidateFields.map((field) => field.id));
+  const answers = normalizeDirectAiAnswers(data)
+    .filter((answer) => candidateIds.has(answer.field_id))
+    .filter((answer) => !hasFieldCurrentValue(fields.find((field) => field.id === answer.field_id)));
+
+  traceAutoBid("ai:answers-received", {
+    count: answers.length,
+    warnings: Array.isArray(data?.warnings) ? data.warnings : [],
+    answers: answers.map((answer) => ({
+      field_id: answer.field_id,
+      value: shortText(answer.value),
+      provider: answer.provider || "",
+      model: answer.model || "",
+      estimated_request_cost_usd: answer.estimated_request_cost_usd ?? null
+    }))
+  });
+
+  if (answers.length === 0) {
+    return {
+      filled: 0,
+      missed: candidateFields.length,
+      filledIds: localFilledIds,
+      missedIds: new Set(candidateFields.map((field) => field.id))
+    };
+  }
+
+  const result = await applyAnswers(answers, filledIds, fields);
+  result.filledIds.forEach((fieldId) => localFilledIds.add(fieldId));
+  const unresolvedFields = candidateFields.filter((field) => !hasFieldCurrentValue(field));
+  return {
+    filled: result.filled,
+    missed: unresolvedFields.length,
+    filledIds: localFilledIds,
+    missedIds: new Set(unresolvedFields.map((field) => field.id))
+  };
 }
 
 function collectPageContext() {
@@ -206,6 +525,7 @@ function collectPageContext() {
     domain: location.hostname.replace(/^www\./, ""),
     title: document.title || "",
     job_title: findJobTitle(),
+    ats: atsAdapters?.describe?.() || { id: "common", name: "Common form" },
     text: (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 18000)
   };
 }
@@ -223,17 +543,22 @@ function collectFields() {
   controls.forEach((control, index) => {
     const type = getControlType(control);
     if (type === "radio") {
-      const key = control.name || control.id || `radio_${index}`;
+      const key = getRadioGroupKey(control, index);
       if (!radioGroups.has(key)) radioGroups.set(key, []);
       radioGroups.get(key).push(control);
       return;
     }
 
     const id = `ab_${index}_${hashSmall(getFieldText(control))}`;
+    const label = getFieldLabel(control);
+    const question = getPlainQuestionText(type === "checkbox" ? getChoiceQuestionLabel(control) || label : label);
+    const option = type === "checkbox" ? getCheckboxOptionLabel(control, question) : "";
     control.dataset.autoBidFieldId = id;
     fields.push({
       id,
-      label: getFieldLabel(control),
+      label,
+      question,
+      option,
       name: control.name || "",
       placeholder: control.getAttribute("placeholder") || "",
       autocomplete: control.getAttribute("autocomplete") || "",
@@ -254,27 +579,31 @@ function collectFields() {
     fields.push({
       id,
       label,
+      question: getPlainQuestionText(label),
+      option: "",
       name: first.name || "",
       placeholder: "",
       autocomplete: "",
       type: "radio",
       required: group.some(isRequired),
       options: group.map(getRadioOptionLabel).filter(Boolean),
-      value: group.find((control) => control.checked)?.value || ""
+      value: getRadioGroupValue(group)
     });
   });
 
   fields.push(...collectButtonChoiceFields(fields.length));
+  fields.push(...collectConsentCheckboxFields(fields.length, fields));
 
   return fields;
 }
 
 function getFormControls() {
-  return queryAll([
+  return queryAll(Array.from(new Set([
     "input",
     "textarea",
     "select",
     "[role='checkbox']",
+    "[role='radio']",
     "button[role='combobox']",
     "[role='combobox']",
     "[aria-haspopup='listbox']",
@@ -282,8 +611,9 @@ function getFormControls() {
     "[data-radix-select-trigger]",
     "[data-slot='select-trigger']",
     ".select__control",
-    "[class*='select'][aria-expanded]"
-  ].join(","));
+    "[class*='select'][aria-expanded]",
+    ...(atsAdapters?.getControlSelectors?.() || [])
+  ])).join(","));
 }
 
 function getControlsByFieldId(fieldId) {
@@ -355,6 +685,8 @@ function collectButtonChoiceFields(startIndex) {
     groups.push({
       id,
       label,
+      question: getPlainQuestionText(label),
+      option: "",
       name: root.getAttribute("name") || first.name || root.id || first.id || "",
       placeholder: "",
       autocomplete: "",
@@ -366,6 +698,146 @@ function collectButtonChoiceFields(startIndex) {
   });
 
   return groups;
+}
+
+function collectConsentCheckboxFields(startIndex, existingFields = []) {
+  const fields = [];
+  const seenControls = new Set();
+  const roots = queryAll([
+    "input[type='checkbox']",
+    "label",
+    "[role='checkbox']",
+    "[class*='checkbox' i]",
+    "[class*='terms' i]",
+    "[class*='privacy' i]",
+    "[class*='consent' i]"
+  ].join(","));
+
+  roots.forEach((root, index) => {
+    if (!isVisible(root)) return;
+    const control = root.matches?.("input[type='checkbox'], [role='checkbox']")
+      ? root
+      : root.querySelector?.("input[type='checkbox'], [role='checkbox']");
+    if (!control) return;
+
+    const label = getConsentCheckboxLabel(root, control);
+    if (!label || !isConsentCheckboxText(label)) return;
+
+    if (seenControls.has(control)) return;
+    if (control.matches?.("input") && control.disabled) return;
+
+    const existingId = control.dataset?.autoBidFieldId || "";
+    const existingField = existingFields.find((field) => field.id === existingId);
+    if (existingField) {
+      existingField.label = label;
+      existingField.question = getPlainQuestionText(label);
+      existingField.option = "";
+      existingField.required = existingField.required || isRequired(control) || /\*/.test(label);
+      existingField.options = ["Yes", "No"];
+      existingField.value = isCheckboxChecked(control) ? "Yes" : "";
+      seenControls.add(control);
+      return;
+    }
+
+    const id = `ab_checkbox_${startIndex + index}_${hashSmall(label)}`;
+    control.dataset.autoBidFieldId = id;
+    if (!control.matches?.("input[type='checkbox']")) control.dataset.autoBidControlType = "checkbox";
+    if (root !== control) root.dataset.autoBidFieldId = id;
+    seenControls.add(control);
+
+    fields.push({
+      id,
+      label,
+      question: getPlainQuestionText(label),
+      option: "",
+      name: control.name || root.getAttribute("name") || root.id || control.id || "",
+      placeholder: "",
+      autocomplete: "",
+      type: "checkbox",
+      required: isRequired(control) || /\*/.test(label),
+      options: ["Yes", "No"],
+      value: isCheckboxChecked(control) ? "Yes" : ""
+    });
+  });
+
+  return fields;
+}
+
+function isConsentCheckboxText(text) {
+  const label = normalize(text);
+  if (isFileUploadChoiceText(label)) return false;
+  if (isSensitiveOrPersonalChoiceCheckbox(label)) return false;
+  return /(terms|privacy|policy|consent|agree|accept|acknowledge|confirm|certify|accurate|process.*data|data.*process)/.test(label);
+}
+
+function isFileUploadChoiceText(label) {
+  const text = normalize(label);
+  return /(accepted file types|file types|resume|cv|cover letter|attach|upload|dropbox|google drive|enter manually|pdf|docx|rtf)/.test(text);
+}
+
+function getConsentCheckboxLabel(root, control) {
+  const input = getCheckboxInput(control) || control;
+  const rootNode = input.getRootNode?.() || document;
+  const forLabel = input.id ? queryOne(`label[for="${cssEscape(input.id)}"]`, rootNode) : null;
+  const row = getConsentCheckboxRow(input, root);
+  return cleanLabel([
+    root.textContent,
+    input.getAttribute?.("aria-label"),
+    input.getAttribute?.("title"),
+    forLabel?.textContent,
+    input.closest?.("label")?.textContent,
+    row?.textContent,
+    ...getNearbyConsentTextCandidates(input)
+  ].filter(Boolean).join(" "));
+}
+
+function getConsentCheckboxRow(input, root = null) {
+  const candidates = [
+    root,
+    input.closest?.("label"),
+    input.closest?.("[class*='checkbox' i], [class*='consent' i], [class*='privacy' i], [class*='terms' i], li, p"),
+    input.parentElement,
+    input.parentElement?.parentElement,
+    getFieldContainer(input)
+  ].filter(Boolean);
+
+  return candidates
+    .filter((candidate) => isVisible(candidate))
+    .map((candidate) => ({
+      element: candidate,
+      text: cleanLabel(candidate.textContent || ""),
+      rect: candidate.getBoundingClientRect()
+    }))
+    .filter((candidate) => candidate.text && candidate.text.length <= 900)
+    .sort((left, right) => {
+      const leftConsent = isConsentCheckboxText(left.text) ? 0 : 1;
+      const rightConsent = isConsentCheckboxText(right.text) ? 0 : 1;
+      return leftConsent - rightConsent || left.rect.height - right.rect.height;
+    })[0]?.element || input.parentElement;
+}
+
+function getNearbyConsentTextCandidates(input) {
+  const candidates = [];
+  const baseRect = input.getBoundingClientRect();
+  const scope = input.closest?.("form, main, [role='main'], section") || document.body;
+  const selector = "label, span, div, p";
+
+  queryAll(selector, scope).forEach((element) => {
+    if (!isVisible(element) || element === input || element.contains(input)) return;
+    if (element.querySelector?.("input, textarea, select, button, [role='button'], [role='combobox']")) return;
+
+    const text = cleanLabel(element.textContent || "");
+    if (!text || text.length > 900 || !isConsentCheckboxText(text)) return;
+
+    const rect = element.getBoundingClientRect();
+    const verticalOverlap = Math.max(0, Math.min(rect.bottom, baseRect.bottom + 28) - Math.max(rect.top, baseRect.top - 28));
+    const horizontalDistance = Math.max(0, rect.left - baseRect.right, baseRect.left - rect.right);
+    if (verticalOverlap <= 0 && Math.abs(rect.top - baseRect.top) > 60) return;
+    if (horizontalDistance > 120) return;
+    candidates.push(text);
+  });
+
+  return candidates.slice(0, 4);
 }
 
 function isChoiceButton(button) {
@@ -387,11 +859,67 @@ function isLikelyButtonChoiceGroup(buttons) {
 
 function isFillableControl(control) {
   const type = getControlType(control);
+  if (control.getAttribute("role") === "radio" && control.querySelector?.("input[type='radio']")) return false;
   const visibleChoiceControl = isVisibleChoiceControl(control, type);
   if ((control.getAttribute("aria-hidden") === "true" && !visibleChoiceControl) || isCompositeComboboxShell(control)) return false;
   if (!isVisible(control) && !visibleChoiceControl) return false;
   if (control.disabled || (control.readOnly && type !== "combobox")) return false;
+  if (isPhoneDialCodeSelector(control, type)) return false;
   return !["hidden", "submit", "button", "reset", "image", "file", "password"].includes(type);
+}
+
+function isPhoneDialCodeSelector(control, type = getControlType(control)) {
+  if (!["combobox", "select"].includes(type)) return false;
+
+  const ownText = cleanLabel([
+    control.value,
+    control.textContent,
+    getComboboxSelectedText(control),
+    control.getAttribute?.("aria-label"),
+    control.getAttribute?.("title"),
+    control.name,
+    control.id
+  ].filter(Boolean).join(" "));
+  const context = normalize([
+    ownText,
+    control.getAttribute?.("aria-label"),
+    control.getAttribute?.("title"),
+    control.name,
+    control.id,
+    getNearbyText(control)
+  ].filter(Boolean).join(" "));
+
+  const phoneContext = /\b(phone|mobile|telephone|cell)\b/.test(context);
+  const dialCodeText = /\+\s*\d{1,4}/.test(ownText) ||
+    /(country code|calling code|dial code|phone code|phone prefix|country prefix)/.test(context);
+
+  return phoneContext && dialCodeText && hasNearbyPhoneNumberInput(control);
+}
+
+function hasNearbyPhoneNumberInput(control) {
+  const roots = [
+    control.parentElement,
+    control.closest("label"),
+    control.closest("[class*='phone' i], [class*='field' i], [class*='input' i], .form-group"),
+    getFieldContainer(control)
+  ].filter(Boolean);
+
+  return roots.some((root) => Array.from(root.querySelectorAll("input"))
+    .some((input) => input !== control && input !== getComboboxInput(control) && isPhoneNumberEntryInput(input)));
+}
+
+function isPhoneNumberEntryInput(input) {
+  if (!input || input.disabled || input.readOnly || !isVisible(input)) return false;
+  const type = String(input.getAttribute("type") || "text").toLowerCase();
+  if (!["tel", "text", "search", "number"].includes(type)) return false;
+  const text = normalize([
+    input.getAttribute("autocomplete"),
+    input.getAttribute("placeholder"),
+    input.getAttribute("aria-label"),
+    input.name,
+    input.id
+  ].join(" "));
+  return type === "tel" || /\b(phone|mobile|telephone|cell|number)\b/.test(text);
 }
 
 function isVisible(element) {
@@ -408,8 +936,11 @@ function isVisibleChoiceControl(control, type = getControlType(control)) {
 }
 
 function getControlType(control) {
+  const adapterType = atsAdapters?.getControlType?.(control);
+  if (adapterType) return adapterType;
   if (control.dataset?.autoBidControlType === "button-group") return "button-group";
   if (control.getAttribute("role") === "checkbox") return "checkbox";
+  if (control.getAttribute("role") === "radio") return "radio";
   if (
     control.getAttribute("role") === "combobox" ||
     ["listbox", "menu"].includes(control.getAttribute("aria-haspopup") || "") ||
@@ -431,7 +962,13 @@ function getControlOptions(control) {
   if (control.tagName === "SELECT") {
     return Array.from(control.options).map((option) => option.textContent.trim()).filter(Boolean);
   }
-  if (getControlType(control) === "combobox") return getVisibleChoiceElements(control).map((option) => cleanLabel(option.textContent || ""));
+  if (getControlType(control) === "combobox") {
+    const options = [
+      ...getVisibleChoiceElements(control),
+      ...(atsAdapters?.getVisibleOptions?.(control) || [])
+    ];
+    return Array.from(new Set(options.map((option) => cleanLabel(option.textContent || option.getAttribute?.("aria-label") || "")).filter(Boolean)));
+  }
   if (getControlType(control) === "checkbox") return ["Yes", "No"];
   return [];
 }
@@ -446,22 +983,52 @@ function getControlValue(control) {
     const value = cleanLabel(control.value || getComboboxSelectedText(control) || control.textContent || "");
     return isPlaceholderChoice(value, value) ? "" : value;
   }
+  if (getControlType(control) === "contenteditable") return cleanLabel(control.textContent || "");
   return control.value || "";
 }
 
 function isRequired(control) {
+  const rootNode = control.getRootNode?.() || document;
+  const explicitLabel = control.id ? queryOne(`label[for="${cssEscape(control.id)}"]`, rootNode) : null;
+  const fieldContainer = getFieldContainer(control);
+  const requiredMarkerElements = [
+    control,
+    explicitLabel,
+    control.closest?.("label"),
+    control.closest?.("fieldset"),
+    fieldContainer,
+    fieldContainer?.querySelector?.("label, legend, [class*='label' i], [class*='required' i]")
+  ].filter(Boolean);
   const requiredText = [
     getFieldLabel(control),
     getNearbyText(control),
     getDescribedByText(control)
   ].join(" ");
   return Boolean(
+    atsAdapters?.isRequired?.(control) ||
     control.required ||
     control.getAttribute("aria-required") === "true" ||
     control.closest("[aria-required='true'], [data-required='true']") ||
+    requiredMarkerElements.some(hasRequiredSemanticMarker) ||
     /\*/.test(requiredText) ||
     /\brequired\b/i.test(requiredText)
   );
+}
+
+function hasRequiredSemanticMarker(element) {
+  if (!element) return false;
+  if (element.matches?.("[required], [aria-required='true'], [data-required='true']")) return true;
+
+  const markerText = [
+    element.getAttribute?.("class"),
+    element.getAttribute?.("data-testid"),
+    element.getAttribute?.("data-ui"),
+    element.getAttribute?.("data-qa"),
+    element.getAttribute?.("aria-label")
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  if (/(^|[^a-z])required([^a-z]|$)/.test(markerText) && !/(not-required|optional)/.test(markerText)) return true;
+  return /\*/.test(cleanLabel(element.textContent || ""));
 }
 
 function getFieldLabel(control) {
@@ -481,6 +1048,7 @@ function getFieldLabel(control) {
   const siblingLabels = getSiblingLabelCandidates(control);
   const choiceLabels = ["checkbox", "radio"].includes(getControlType(control)) ? getChoiceInlineLabelCandidates(control) : [];
   const candidates = [
+    ...(atsAdapters?.getLabelCandidates?.(control) || []),
     fromFor?.textContent,
     closestLabel?.textContent,
     fromAria,
@@ -505,7 +1073,7 @@ function getFieldText(control) {
 }
 
 function getFieldContainer(control) {
-  return control.closest(FIELD_CONTAINER_SELECTOR) || control.parentElement;
+  return atsAdapters?.getFieldContainer?.(control) || control.closest(FIELD_CONTAINER_SELECTOR) || control.parentElement;
 }
 
 function getDescribedByText(control) {
@@ -581,6 +1149,30 @@ function getRadioGroupLabel(group) {
     return cleanLabel(first.name || label || options.join(" "));
   }
   return label;
+}
+
+function getRadioGroupKey(control, index) {
+  const name = cleanLabel(control.name || control.getAttribute?.("name") || "");
+  if (name) return `name:${name}`;
+
+  const explicitGroup = control.closest?.("[role='radiogroup'], fieldset");
+  if (explicitGroup) return explicitGroup;
+
+  if (control.getAttribute?.("role") === "radio") {
+    let current = control.parentElement;
+    for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+      const radios = Array.from(current.querySelectorAll?.("[role='radio']") || [])
+        .filter((candidate) => isVisible(candidate) && !candidate.querySelector?.("input[type='radio']"));
+      if (radios.length >= 2 && radios.length <= 20) return current;
+    }
+  }
+
+  return control.id ? `id:${control.id}` : `radio:${index}`;
+}
+
+function getRadioGroupValue(group) {
+  const checked = group.find(isRadioChecked);
+  return checked ? getRadioOptionLabel(checked) || checked.value || "" : "";
 }
 
 function getChoiceGroupLabel(group) {
@@ -762,58 +1354,319 @@ function getRadioOptionLabel(control) {
     control.closest("label")?.textContent ||
     (siblingLabel && !siblingLabel.contains(control) ? siblingLabel.textContent : "") ||
     control.getAttribute("aria-label") ||
+    control.textContent ||
     (normalize(value) === "on" ? "" : value)
   );
+}
+
+function isRadioChecked(control) {
+  if (!control) return false;
+  if (control.matches?.("input[type='radio']")) return Boolean(control.checked);
+  if (control.getAttribute?.("aria-checked") === "true") return true;
+  if (["checked", "selected", "on"].includes(control.getAttribute?.("data-state"))) return true;
+  return Boolean(control.matches?.("[aria-selected='true'], .checked, .selected, .active, [class*='checked' i], [class*='selected' i], [class*='active' i]"));
 }
 
 function cleanLabel(text) {
   return String(text || "").replace(/\s+/g, " ").replace(/\s+\*/g, " *").trim().slice(0, 300);
 }
 
-async function applyAnswers(answers, skipFilledIds = new Set()) {
+function getPlainQuestionText(text) {
+  return cleanLabel(text)
+    .replace(/\s*\*\s*/g, " ")
+    .replace(/\s+\(required\)\s*$/i, "")
+    .replace(/\brequired\b\s*:?\s*/gi, "")
+    .replace(/\s+([?.!,])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getCheckboxOptionLabel(control, questionText = "") {
+  const root = control.closest("label, [class*='checkbox' i], [class*='option' i], li, [role='checkbox']");
+  const rootNode = control.getRootNode?.() || document;
+  const forLabel = control.id ? queryOne(`label[for="${cssEscape(control.id)}"]`, rootNode) : null;
+  const candidates = [
+    forLabel?.textContent,
+    control.closest("label")?.textContent,
+    root && root !== control ? root.textContent : "",
+    ...getChoiceInlineLabelCandidates(control),
+    control.getAttribute("aria-label"),
+    normalize(control.value) === "on" ? "" : control.value
+  ];
+  const question = getPlainQuestionText(questionText);
+
+  return candidates
+    .map((candidate) => stripQuestionFromOptionText(candidate, question))
+    .filter(Boolean)
+    .find((candidate) => normalize(candidate) !== normalize(question) && !/^(yes|no|true|false|on|off)$/.test(normalize(candidate))) || "";
+}
+
+function stripQuestionFromOptionText(text, questionText) {
+  let value = getPlainQuestionText(text);
+  const question = getPlainQuestionText(questionText);
+  if (!value) return "";
+  if (!question) return value;
+
+  const normalizedValue = normalize(value);
+  const normalizedQuestion = normalize(question);
+  if (normalizedValue === normalizedQuestion) return "";
+
+  if (normalizedValue.includes(normalizedQuestion)) {
+    value = value.replace(new RegExp(escapeRegExp(question), "i"), "").trim();
+  }
+
+  return getPlainQuestionText(value.replace(/^[-:\s]+/, ""));
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getCurrentlyFilledFieldIds(fields) {
+  const filledIds = new Set();
+  for (const field of fields) {
+    if (hasFieldCurrentValue(field)) filledIds.add(field.id);
+  }
+  return filledIds;
+}
+
+async function closeOpenChoiceMenus() {
+  const targets = [
+    document.activeElement,
+    ...queryAll("[aria-expanded='true']")
+  ]
+    .filter(Boolean)
+    .filter((target) => target?.getAttribute?.("aria-expanded") === "true")
+    .filter((target) => {
+      const role = normalize(target.getAttribute?.("role") || "");
+      const hasPopup = normalize(target.getAttribute?.("aria-haspopup") || "");
+      return /combobox|button|listbox|menu/.test(role) || /listbox|menu|true/.test(hasPopup);
+    });
+
+  targets.forEach((target) => {
+    target.dispatchEvent?.(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+    target.dispatchEvent?.(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+  });
+
+  if (targets.length > 0) await sleep(120);
+}
+
+async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
   let filled = 0;
   let missed = 0;
   const filledIds = new Set();
   const missedIds = new Set();
+  const fieldsById = new Map((fields || []).map((field) => [field.id, field]));
+  const claimedLiveFields = new Set();
 
   for (const answer of answers) {
-    const controls = getControlsByFieldId(answer.field_id);
-    if (controls.length === 0) {
+    const requestedFieldId = answer.field_id;
+    const sourceField = fieldsById.get(requestedFieldId) || null;
+    const binding = resolveLiveFieldForAnswer(answer, sourceField, claimedLiveFields);
+    if (!binding) {
+      const attemptKey = getGeneratedAnswerAttemptKey(answer, sourceField);
+      const attempt = recordGeneratedAnswerFillFailure(attemptKey);
       missed += 1;
-      missedIds.add(answer.field_id);
+      missedIds.add(requestedFieldId);
+      traceAutoBid("answer:unbound", {
+        field_id: requestedFieldId,
+        question: answer.question || sourceField?.question || sourceField?.label || "",
+        source: answer.source || "",
+        attempt,
+        max_attempts: MAX_FIELD_FILL_ATTEMPTS
+      });
       continue;
     }
-    if (skipFilledIds.has(answer.field_id) && hasCurrentChoiceValue(controls)) {
-      traceAutoBid("answer:skipped-positive-dropdown", {
-        field_id: answer.field_id,
+
+    const { field, controls, rebound, score } = binding;
+    const attemptKey = getGeneratedAnswerAttemptKey(answer, field);
+    claimedLiveFields.add(getStableFieldBindingKey(field));
+    if (rebound) {
+      traceAutoBid("answer:rebound", {
+        requested_field_id: requestedFieldId,
+        live_field_id: field.id,
+        question: field.question || field.label || "",
+        score
+      });
+    }
+
+    const alreadyFilled = hasFieldCurrentValue(field, controls);
+    if (alreadyFilled) {
+      traceAutoBid("answer:skipped-filled", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
         answer: answer.value || "",
         source: answer.source || "",
         current: getCurrentChoiceSummary(controls)
       });
-      filledIds.add(answer.field_id);
+      filledIds.add(requestedFieldId);
+      filledIds.add(field.id);
       continue;
     }
-    if (await setControlsValue(controls, answer.value || "")) {
-      traceAutoBid("answer:applied", {
-        field_id: answer.field_id,
+
+    const previousAttempts = getGeneratedAnswerFillAttempts(attemptKey);
+    if (previousAttempts >= MAX_FIELD_FILL_ATTEMPTS) {
+      traceAutoBid("answer:stopped-after-max-attempts", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
         answer: answer.value || "",
+        source: answer.source || "",
+        attempts: previousAttempts,
+        max_attempts: MAX_FIELD_FILL_ATTEMPTS
+      });
+      missed += 1;
+      missedIds.add(requestedFieldId);
+      continue;
+    }
+
+    const declaredOptions = sourceField?.options?.length > 0 ? sourceField.options : field.options || [];
+    const declaredChoice = isChoiceFieldType(field.type) && declaredOptions.length > 0
+      ? findBestChoice(declaredOptions.map((option) => ({ text: option, value: option })), answer.value || "")
+      : null;
+    if (isChoiceFieldType(field.type) && declaredOptions.length > 0 && !declaredChoice) {
+      const attempt = recordGeneratedAnswerFillFailure(attemptKey);
+      traceAutoBid("answer:invalid-choice", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
+        answer: answer.value || "",
+        source: answer.source || "",
+        options: declaredOptions,
+        attempt,
+        max_attempts: MAX_FIELD_FILL_ATTEMPTS,
+        stopped: attempt >= MAX_FIELD_FILL_ATTEMPTS
+      });
+      missed += 1;
+      missedIds.add(requestedFieldId);
+      continue;
+    }
+
+    const valueToApply = declaredChoice?.text || declaredChoice?.value || answer.value || "";
+    if (await setControlsValue(controls, valueToApply, field)) {
+      traceAutoBid("answer:applied", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
+        answer: answer.value || "",
+        applied_answer: valueToApply,
         source: answer.source || "",
         current: getCurrentChoiceSummary(controls)
       });
       filled += 1;
-      filledIds.add(answer.field_id);
+      filledIds.add(requestedFieldId);
+      filledIds.add(field.id);
     } else {
+      const attempt = recordGeneratedAnswerFillFailure(attemptKey);
       traceAutoBid("answer:missed", {
-        field_id: answer.field_id,
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
         answer: answer.value || "",
-        source: answer.source || ""
+        source: answer.source || "",
+        attempt,
+        max_attempts: MAX_FIELD_FILL_ATTEMPTS,
+        stopped: attempt >= MAX_FIELD_FILL_ATTEMPTS
       });
       missed += 1;
-      missedIds.add(answer.field_id);
+      missedIds.add(requestedFieldId);
     }
   }
 
   return { filled, missed, filledIds, missedIds };
+}
+
+function getGeneratedAnswerAttemptKey(answer, field) {
+  const stableField = field ? getStableFieldBindingKey(field) : "";
+  return stableField || [
+    normalize(answer?.question || ""),
+    normalize(answer?.option || ""),
+    String(answer?.field_id || "")
+  ].join("|");
+}
+
+function getGeneratedAnswerFillAttempts(attemptKey) {
+  return Number(generatedAnswerFillAttempts.get(attemptKey) || 0);
+}
+
+function recordGeneratedAnswerFillFailure(attemptKey) {
+  const attempts = Math.min(MAX_FIELD_FILL_ATTEMPTS, getGeneratedAnswerFillAttempts(attemptKey) + 1);
+  generatedAnswerFillAttempts.set(attemptKey, attempts);
+  return attempts;
+}
+
+function resolveLiveFieldForAnswer(answer, sourceField, claimedLiveFields = new Set()) {
+  const liveFields = collectFields();
+  const directField = liveFields.find((field) => field.id === answer.field_id);
+  if (directField) {
+    const controls = getControlsByFieldId(directField.id);
+    if (controls.length > 0) {
+      return { field: directField, controls, rebound: false, score: 10000 };
+    }
+  }
+
+  const scored = liveFields
+    .filter((field) => !claimedLiveFields.has(getStableFieldBindingKey(field)))
+    .map((field) => ({
+      field,
+      score: scoreLiveFieldForAnswer(field, sourceField, answer)
+    }))
+    .filter((candidate) => candidate.score >= 260)
+    .sort((left, right) => right.score - left.score);
+
+  const best = scored[0];
+  if (!best) return null;
+  const controls = getControlsByFieldId(best.field.id);
+  if (controls.length === 0) return null;
+  return { field: best.field, controls, rebound: best.field.id !== answer.field_id, score: best.score };
+}
+
+function scoreLiveFieldForAnswer(liveField, sourceField, answer) {
+  if (sourceField && !areFieldTypesCompatible(sourceField.type, liveField.type)) return -1;
+
+  let score = sourceField?.type === liveField.type ? 120 : 45;
+  const liveQuestion = normalize(liveField.question || liveField.label || "");
+  const sourceQuestion = normalize(sourceField?.question || sourceField?.label || "");
+  const answerQuestion = normalize(answer.question || "");
+  const liveLabel = normalize(liveField.label || "");
+  const sourceLabel = normalize(sourceField?.label || "");
+
+  score += scoreFieldIdentityText(liveQuestion, sourceQuestion, 720, 330);
+  score += scoreFieldIdentityText(liveQuestion, answerQuestion, 640, 300);
+  score += scoreFieldIdentityText(liveLabel, sourceLabel, 420, 180);
+  score += scoreFieldIdentityText(normalize(liveField.name), normalize(sourceField?.name), 320, 100);
+  score += scoreFieldIdentityText(normalize(liveField.placeholder), normalize(sourceField?.placeholder), 180, 70);
+
+  const liveOption = normalize(liveField.option || "");
+  const sourceOption = normalize(sourceField?.option || answer.option || "");
+  score += scoreFieldIdentityText(liveOption, sourceOption, 520, 220);
+
+  const liveOptions = new Set((liveField.options || []).map(normalize).filter(Boolean));
+  const sourceOptions = (sourceField?.options || []).map(normalize).filter(Boolean);
+  const sharedOptions = sourceOptions.filter((option) => liveOptions.has(option)).length;
+  if (sharedOptions > 0) score += Math.min(240, sharedOptions * 80);
+  if (sourceField && Boolean(sourceField.required) === Boolean(liveField.required)) score += 20;
+
+  return score;
+}
+
+function scoreFieldIdentityText(left, right, exactScore, partialScore) {
+  if (!left || !right) return 0;
+  if (left === right) return exactScore;
+  if (Math.min(left.length, right.length) >= 8 && (left.includes(right) || right.includes(left))) return partialScore;
+  return 0;
+}
+
+function areFieldTypesCompatible(left, right) {
+  if (!left || !right || left === right) return true;
+  if (isChoiceFieldType(left) && isChoiceFieldType(right)) return true;
+  const textTypes = new Set(["text", "email", "tel", "url", "number", "date", "textarea"]);
+  return textTypes.has(left) && textTypes.has(right);
+}
+
+function getStableFieldBindingKey(field) {
+  return [
+    normalize(field.question || field.label || ""),
+    normalize(field.option || ""),
+    normalize(field.name || ""),
+    field.type || ""
+  ].join("|");
 }
 
 async function applyResidenceAnswers(fields, answers, filledIds) {
@@ -895,15 +1748,17 @@ async function applyLanguageChoiceAnswers(fields, filledIds) {
   let missed = 0;
 
   for (const field of fields) {
-    if (filledIds.has(field.id) || !isLanguageChoiceField(field)) continue;
+    if (!isLanguageChoiceField(field)) continue;
 
     const controls = getControlsByFieldId(field.id);
     if (controls.length === 0) continue;
 
     const questionLanguages = getQuestionLanguageAliases(field.label);
-    const answer = getLanguageChoiceAnswer(questionLanguages);
+    const answer = getLanguageChoiceAnswer(field, questionLanguages);
+    if (!answer) continue;
+
     const current = getCurrentChoiceSummary(controls);
-    if (normalize(current) === normalize(answer)) {
+    if (isLanguageChoiceAlreadyAcceptable(field, current, answer)) {
       filledLocalIds.add(field.id);
       continue;
     }
@@ -932,6 +1787,110 @@ async function applyLanguageChoiceAnswers(fields, filledIds) {
   return { filled, missed, filledIds: filledLocalIds };
 }
 
+async function applyReferralSourceAnswers(fields, filledIds) {
+  const filledLocalIds = new Set();
+  let filled = 0;
+  let missed = 0;
+
+  for (const field of fields) {
+    if (filledIds.has(field.id) || !isReferralSourceField(field)) continue;
+
+    const controls = getControlsByFieldId(field.id);
+    if (controls.length === 0 || hasFieldCurrentValue(field, controls)) continue;
+
+    if (await setReferralSourceValue(controls, field)) {
+      filled += 1;
+      filledLocalIds.add(field.id);
+      traceAutoBid("referral-source:applied", {
+        field_id: field.id,
+        label: field.label,
+        answer: "LinkedIn",
+        current: getCurrentChoiceSummary(controls)
+      });
+    } else {
+      missed += 1;
+      traceAutoBid("referral-source:missed", {
+        field_id: field.id,
+        label: field.label,
+        answer: "LinkedIn"
+      });
+    }
+  }
+
+  return { filled, missed, filledIds: filledLocalIds };
+}
+
+async function setReferralSourceValue(controls, field) {
+  if (await setControlsValue(controls, "LinkedIn", field)) return true;
+
+  const first = controls[0];
+  const type = getControlType(first);
+  if (type !== "combobox") return false;
+
+  const options = await getComboboxChoices(first);
+  const choices = options.map((option, index) => ({
+    control: option,
+    text: option.textContent,
+    value: option.getAttribute("data-value") || option.getAttribute("value") || option.textContent,
+    index
+  }));
+  const match = findBestChoice(choices, "LinkedIn") || choices[0] || null;
+  if (!match) {
+    await closeCombobox(first);
+    return false;
+  }
+
+  traceAutoBid("referral-source:default-choice", {
+    field_id: field.id,
+    label: field.label,
+    choice: summarizeChoice(match)
+  });
+  const selected = await selectComboboxChoice(first, match);
+  if (!selected) await closeCombobox(first);
+  return selected;
+}
+
+async function applyConsentChoiceAnswers(fields, filledIds) {
+  const filledLocalIds = new Set();
+  let filled = 0;
+  let missed = 0;
+
+  for (const field of fields) {
+    if (filledIds.has(field.id) || !isConsentChoiceField(field)) continue;
+
+    const controls = getControlsByFieldId(field.id);
+    if (controls.length === 0) continue;
+
+    const current = getCurrentChoiceSummary(controls);
+    const answer = getConsentChoiceAnswer(field);
+    if (!answer) continue;
+
+    if (isConsentChoiceAlreadyAccepted(current)) {
+      filledLocalIds.add(field.id);
+      continue;
+    }
+
+    const selected = await setControlsValue(controls, answer, field);
+    traceAutoBid("consent-choice:result", {
+      field_id: field.id,
+      label: field.label,
+      answer,
+      selected,
+      previous: current,
+      current: getCurrentChoiceSummary(controls)
+    });
+
+    if (selected) {
+      filled += 1;
+      filledLocalIds.add(field.id);
+    } else {
+      missed += 1;
+    }
+  }
+
+  return { filled, missed, filledIds: filledLocalIds };
+}
+
 async function applyProfileStaticFallbacks(fields, filledIds) {
   const filledLocalIds = new Set();
   let profileStatic;
@@ -945,8 +1904,9 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
 
   const staticFields = profileStatic?.static_fields || {};
   const availableKeys = Object.keys(staticFields).filter((key) => String(staticFields[key] || "").trim());
-  let filled = 0;
-  let missed = 0;
+  const phoneDialResult = await applyPhoneDialCodeSelectors(staticFields);
+  let filled = phoneDialResult.filled;
+  let missed = phoneDialResult.missed;
   const matched = [];
   const missing = [];
 
@@ -957,23 +1917,55 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
 
     matched.push({ field_id: field.id, key, label: field.label });
     const rawValue = getProfileStaticValue(staticFields, key);
-    if (rawValue === undefined || rawValue === null || !String(rawValue).trim()) {
+    let controls = getControlsByFieldId(field.id);
+    const candidateValues = getProfileStaticCandidateValues(staticFields, key, field, controls);
+    if (candidateValues.length === 0) {
       missing.push({ field_id: field.id, key, label: field.label });
       continue;
     }
 
-    const controls = getControlsByFieldId(field.id);
-    if (controls.length === 0 || !shouldApplyProfileStaticValue(field, controls, rawValue)) continue;
+    if (controls.length === 0 || !shouldApplyProfileStaticValue(field, controls, rawValue, key)) continue;
 
-    const value = formatProfileStaticValueForField(key, rawValue, field);
-    if (await setControlsValue(controls, value)) {
+    let appliedValue = "";
+    for (let candidateIndex = 0; candidateIndex < candidateValues.length; candidateIndex += 1) {
+      const value = formatProfileStaticValueForField(key, candidateValues[candidateIndex], field);
+      if (candidateIndex > 0) {
+        await clearControlsForRetry(controls);
+        const rebound = resolveLiveFieldForAnswer({
+          field_id: field.id,
+          question: field.question || field.label || ""
+        }, field);
+        if (rebound) controls = rebound.controls;
+      }
+
+      const selected = await setControlsValue(controls, value, field, {
+        country: getProfileStaticValue(staticFields, "country"),
+        locationCountryFirst: ["country", "location", "city"].includes(key),
+        profileKey: key
+      });
+      traceAutoBid("profile-static:attempt", {
+        field_id: field.id,
+        key,
+        label: field.label,
+        candidate_index: candidateIndex,
+        value: shortText(value),
+        selected
+      });
+      if (selected) {
+        appliedValue = value;
+        break;
+      }
+      await clearControlsForRetry(controls);
+    }
+
+    if (appliedValue) {
       filled += 1;
       filledLocalIds.add(field.id);
       traceAutoBid("profile-static:applied", {
         field_id: field.id,
         key,
         label: field.label,
-        value: shortText(value),
+        value: shortText(appliedValue),
         current: getCurrentChoiceSummary(controls)
       });
     } else {
@@ -982,7 +1974,7 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
         field_id: field.id,
         key,
         label: field.label,
-        value: shortText(value)
+        values: candidateValues.map((value) => shortText(value))
       });
     }
   }
@@ -992,18 +1984,1871 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
     available_keys: availableKeys,
     matched,
     missing,
+    phone_dial_code: phoneDialResult,
     filled
   });
 
   return { filled, missed, filledIds: filledLocalIds };
 }
 
-function shouldApplyProfileStaticValue(field, controls, rawValue) {
+async function applyPhoneDialCodeSelectors(staticFields) {
+  const country = getPhoneDialCountryValue(staticFields);
+  if (!country) return { filled: 0, missed: 0, country: "" };
+
+  const controls = getPhoneDialCodeControls();
+  let filled = 0;
+  let missed = 0;
+
+  for (const control of controls) {
+    if (isDialCodeSelectorAlreadyCountry(control, country)) {
+      await closeCombobox(control);
+      continue;
+    }
+
+    const selected = await setControlsValue([control], country);
+    traceAutoBid("phone-dial-code:applied", {
+      country,
+      selected,
+      current: getCurrentChoiceSummary([control])
+    });
+
+    if (selected || isDialCodeSelectorAlreadyCountry(control, country)) {
+      filled += 1;
+      await closeCombobox(control);
+    } else {
+      missed += 1;
+      await closeCombobox(control);
+    }
+  }
+
+  return { filled, missed, country, controls: controls.length };
+}
+
+function getPhoneDialCodeControls() {
+  const selector = [
+    "select",
+    "button[role='combobox']",
+    "[role='combobox']",
+    "[aria-haspopup='listbox']",
+    "[aria-haspopup='menu'][aria-expanded]",
+    "[data-radix-select-trigger]",
+    "[data-slot='select-trigger']",
+    ".select__control",
+    "[class*='select'][aria-expanded]"
+  ].join(",");
+
+  return queryAll(selector).filter((control) => isVisible(control) && isPhoneDialCodeSelector(control));
+}
+
+function getPhoneDialCountryValue(staticFields) {
+  const country = String(getProfileStaticValue(staticFields, "country") || "").trim();
+  if (country) return country;
+
+  const location = String(getProfileStaticValue(staticFields, "location") || "").trim();
+  if (!location) return "";
+  const pieces = location.split(",").map((part) => part.trim()).filter(Boolean);
+  return pieces.length > 1 ? pieces[pieces.length - 1] : "";
+}
+
+function isDialCodeSelectorAlreadyCountry(control, country) {
+  const rawCurrent = [
+    getCurrentChoiceSummary([control]),
+    control.value,
+    control.textContent,
+    getComboboxSelectedText(control)
+  ].filter(Boolean).join(" ");
+  const current = normalize(rawCurrent);
+  const expectedCountry = normalize(country);
+  const expectedCode = getDialCodeForCountry(country);
+
+  if (expectedCountry && (current.includes(expectedCountry) || scoreChoice(current, expectedCountry) >= 70)) return true;
+  return Boolean(expectedCode && rawCurrent.includes(expectedCode));
+}
+
+function getDialCodeForCountry(country) {
+  const normalized = normalize(country);
+  if (PHONE_DIAL_CODES_BY_COUNTRY[normalized]) return PHONE_DIAL_CODES_BY_COUNTRY[normalized];
+
+  const match = Object.entries(PHONE_DIAL_CODES_BY_COUNTRY)
+    .find(([name]) => normalized.includes(name) || name.includes(normalized));
+  return match?.[1] || "";
+}
+
+async function attachResumeFromSheet() {
+  let inputs = getResumeFileInputs();
+  if (inputs.every((input) => input.files?.length) && inputs.length > 0) {
+    traceAutoBid("resume:already-attached", {
+      files: inputs.flatMap(getResumeInputAttachedFilenames),
+      server_confirmed: inputs.some(hasServerConfirmedResumeUpload),
+      reason: "browser-file-input-populated"
+    });
+    return { filled: 0, missed: 0, reason: "already-attached" };
+  }
+
+  let payload;
+  try {
+    payload = await fetchResumePayload(inputs);
+  } catch (error) {
+    traceAutoBid("resume:fetch-error", { message: error.message || String(error) });
+    return { filled: 0, missed: 1, reason: "fetch-error" };
+  }
+
+  if (!payload?.base64) {
+    traceAutoBid("resume:no-file", { payload: summarizeResumePayload(payload) });
+    return { filled: 0, missed: 1, reason: "no-file" };
+  }
+
+  let file;
+  try {
+    file = fileFromBase64(payload);
+  } catch (error) {
+    traceAutoBid("resume:file-error", { message: error.message || String(error), payload: summarizeResumePayload(payload) });
+    return { filled: 0, missed: 1, reason: "file-error" };
+  }
+
+  let chooserResult = null;
+  if (inputs.length === 0) {
+    traceAutoBid("resume:no-input-before-chooser", {
+      candidates: getFileInputCandidatesDebug(),
+      zones: getResumeUploadZoneDebug()
+    });
+    chooserResult = await attachResumeViaNativeFileChooser(file, payload);
+    traceAutoBid("resume:file-chooser-upload", chooserResult);
+    if (chooserResult.attached) {
+      return { filled: 1, missed: 0, filename: file.name, method: "file-chooser" };
+    }
+    inputs = await waitForResumeFileInputs();
+  }
+
+  let filled = 0;
+  let missed = 0;
+  for (const input of inputs) {
+    if (input.files?.length) continue;
+    const attached = await setFileInputValue(input, file, payload);
+    traceAutoBid("resume:attached", {
+      selected: attached,
+      server_confirmed: attached && isServerTrackedResumeInput(input),
+      filename: file.name,
+      mime_type: file.type,
+      context: shortText(getFileInputContextText(input))
+    });
+    if (attached) filled += 1;
+    else missed += 1;
+  }
+
+  if (filled === 0 && !chooserResult?.attempted) {
+    chooserResult = await attachResumeViaNativeFileChooser(file, payload);
+    traceAutoBid("resume:file-chooser-upload", chooserResult);
+    if (chooserResult.attached) {
+      return { filled: 1, missed: 0, filename: file.name, method: "file-chooser" };
+    }
+  }
+
+  if (inputs.length === 0) {
+    traceAutoBid("resume:no-input", {
+      candidates: getFileInputCandidatesDebug(),
+      zones: getResumeUploadZoneDebug()
+    });
+    return { filled: 0, missed: 1, filename: file.name, reason: "no-input" };
+  }
+
+  return { filled, missed, filename: file.name };
+}
+
+function fetchResumePayload(inputs) {
+  return send("SHEET_FETCH_RESUME_FILE", {
+    page: collectPageContext(),
+    accept: Array.from(new Set(inputs.map((input) => input.accept).filter(Boolean)))
+  });
+}
+
+async function attachResumeViaNativeFileChooser(file, payload = {}) {
+  const localPath = String(payload.local_path || payload.localPath || "").trim();
+  if (!localPath) return { attempted: false, attached: false, reason: "no-local-path" };
+
+  const button = findResumeAttachButton();
+  if (!button) return { attempted: false, attached: false, reason: "attach-button-not-found" };
+  const confirmationBefore = getResumeServerConfirmationSnapshot();
+
+  await scrollElementIntoView(button, "center");
+  const target = getHitTarget(button);
+  const rect = target.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+    return { attempted: true, attached: false, reason: "attach-button-not-clickable" };
+  }
+
+  try {
+    const result = await send("NATIVE_FILE_CHOOSER_UPLOAD", {
+      x,
+      y,
+      local_path: localPath,
+      filename: file.name
+    });
+    await sleep(900);
+    const attached = await waitForAnyResumeUploadConfirmation(
+      file.name,
+      Boolean(result?.uploaded),
+      RESUME_SERVER_CONFIRM_TIMEOUT_MS,
+      confirmationBefore
+    );
+    return {
+      attempted: true,
+      attached,
+      server_confirmed: hasNewResumeServerConfirmation(file.name, confirmationBefore),
+      uploaded: Boolean(result?.uploaded),
+      files: Number(result?.files || 0),
+      button: shortText(button.textContent || button.getAttribute?.("aria-label") || ""),
+      filename: file.name,
+      reason: result?.reason || ""
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      attached: false,
+      uploaded: false,
+      button: shortText(button.textContent || button.getAttribute?.("aria-label") || ""),
+      filename: file.name,
+      reason: error.message || String(error)
+    };
+  }
+}
+
+async function waitForResumeFileInputs(timeoutMs = RESUME_FILE_INPUT_WAIT_MS) {
+  const started = Date.now();
+  let inputs = getResumeFileInputs();
+  let revealAttempted = false;
+
+  while (inputs.length === 0 && Date.now() - started < timeoutMs) {
+    if (!revealAttempted) {
+      revealAttempted = true;
+      const revealResult = await revealResumeFileInput();
+      if (revealResult.attempted) {
+        traceAutoBid("resume:reveal", revealResult);
+      }
+    }
+    await sleep(RESUME_FILE_INPUT_RETRY_MS);
+    inputs = getResumeFileInputs();
+  }
+
+  return inputs;
+}
+
+async function revealResumeFileInput() {
+  const button = findResumeAttachButton();
+  if (!button) return { attempted: false, clicked: false, reason: "button-not-found" };
+
+  await scrollElementIntoView(button, "center");
+  dispatchRealisticMouseClick(button);
+  await sleep(600);
+  return {
+    attempted: true,
+    clicked: true,
+    text: shortText(button.textContent || button.getAttribute?.("aria-label") || ""),
+    inputs_after: getResumeFileInputs().length
+  };
+}
+
+function findResumeAttachButton() {
+  const candidates = queryAll("button, [role='button'], label, a")
+    .filter((element) => isVisible(element) && !isDisabledSubmitButton(element))
+    .map((element) => ({
+      element,
+      text: normalize([element.textContent, element.getAttribute?.("aria-label"), element.getAttribute?.("title")].filter(Boolean).join(" ")),
+      context: normalize(getResumeAttachButtonContext(element))
+    }))
+    .filter((candidate) => isResumeAttachButtonText(candidate.text) && isResumeAttachButtonContext(candidate.context))
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreResumeAttachButton(candidate.text, candidate.context)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return candidates[0]?.element || null;
+}
+
+function getResumeAttachButtonContext(element) {
+  const roots = [
+    element.closest?.("section, fieldset, label, [class*='resume' i], [class*='cv' i], [class*='upload' i], [class*='attachment' i], [class*='field' i], .form-group"),
+    element.parentElement,
+    element.closest?.("form")
+  ].filter(Boolean);
+  return roots.map((root) => cleanLabel(root.textContent || "")).join(" ");
+}
+
+function isResumeAttachButtonText(text) {
+  if (!text) return false;
+  if (/(dropbox|google drive|drive|manual|manually|paste|cover letter|portfolio|photo|avatar|image)/.test(text)) return false;
+  return /^(attach|upload|browse|choose file|choose a file|select file|select a file|add file)$/.test(text) ||
+    /\b(attach|upload|browse|choose (?:a )?file|select (?:a )?file|add file)\b/.test(text);
+}
+
+function isResumeAttachButtonContext(context) {
+  if (!context) return false;
+  return /\b(resume|cv|curriculum vitae)\b/.test(context) ||
+    /\baccepted file types\b.*\b(pdf|doc|docx|rtf|txt|jpg|jpeg|png)\b/.test(context) ||
+    isGenericApplicationFileUploadText(context);
+}
+
+function scoreResumeAttachButton(text, context) {
+  let score = 0;
+  if (/\b(resume|cv|curriculum vitae)\b/.test(context)) score += 120;
+  if (/^attach$/.test(text)) score += 80;
+  if (/^upload$|^upload file$/.test(text)) score += 70;
+  if (/\b(pdf|doc|docx|rtf|txt)\b/.test(context)) score += 30;
+  if (isGenericApplicationFileUploadText(context)) score += 35;
+  return score;
+}
+
+function getResumeFileInputs() {
+  const inputs = queryAll("input[type='file']")
+    .filter((input) => !input.disabled);
+  const scored = inputs
+    .map((input) => ({
+      input,
+      score: scoreResumeFileInput(input),
+      context: getFileInputContextText(input)
+    }))
+    .filter((candidate) => candidate.score > -100)
+    .sort((left, right) => right.score - left.score);
+
+  const resumeInputs = scored
+    .filter((candidate) => candidate.score >= 90)
+    .map((candidate) => candidate.input);
+  if (resumeInputs.length > 0) return resumeInputs;
+
+  const nonCoverLetterInputs = scored
+    .filter((candidate) => !isCoverLetterFileText(candidate.context))
+    .map((candidate) => candidate.input);
+  return nonCoverLetterInputs.length === 1 ? nonCoverLetterInputs : [];
+}
+
+function isResumeFileInput(input) {
+  return scoreResumeFileInput(input) >= 90;
+}
+
+function scoreResumeFileInput(input) {
+  const context = getFileInputContextText(input);
+  const text = normalize(context);
+  const uploadZone = getAssociatedResumeUploadZone(input);
+  const uploadZoneText = normalize(uploadZone?.textContent || "");
+  const attributes = normalize([
+    input.name,
+    input.id,
+    input.getAttribute("aria-label"),
+    input.getAttribute("title"),
+    input.getAttribute("data-testid"),
+    input.getAttribute("data-test"),
+    input.getAttribute("class")
+  ].join(" "));
+
+  if (isCoverLetterFileText(text) || isCoverLetterFileText(attributes)) return -1000;
+
+  let score = 0;
+  if (uploadZone && !isCoverLetterFileText(uploadZoneText)) score += 110;
+  if (/\b(resume|cv|curriculum vitae)\b/.test(text)) score += 120;
+  if (/\b(resume|cv|curriculum vitae)\b/.test(attributes)) score += 100;
+  if (/\b(upload|attach|attachment|file|drop|drag|browse|choose)\b/.test(text)) score += 30;
+  if (/\b(pdf|doc|docx|rtf|jpg|jpeg|png)\b/.test(text) || acceptsResumeDocument(input)) score += 15;
+  if (/\b(upload|attach|file)\b/.test(attributes)) score += 10;
+  if (isGenericApplicationFileUploadText(text)) score += 75;
+  if (isGenericApplicationFileUploadText(attributes)) score += 45;
+
+  return score;
+}
+
+function isCoverLetterFileText(value) {
+  return /(cover letter|motivation letter|supporting statement|portfolio|photo|avatar|image|transcript|certificate)/.test(normalize(value));
+}
+
+function acceptsResumeDocument(input) {
+  const accept = normalize(input.accept || input.getAttribute("accept") || "");
+  if (!accept) return false;
+  return /(pdf|doc|docx|rtf|txt|text|msword|officedocument wordprocessingml document|jpeg|jpg|png|image)/.test(accept);
+}
+
+function getFileInputCandidatesDebug() {
+  return queryAll("input[type='file']")
+    .map((input) => ({
+      score: scoreResumeFileInput(input),
+      disabled: Boolean(input.disabled),
+      has_file: Boolean(input.files?.length),
+      attached: isResumeInputAttached(input),
+      server_confirmed: hasServerConfirmedResumeUpload(input),
+      component_files: getResumeUploadComponentFileMetadata(input),
+      accept: input.accept || input.getAttribute("accept") || "",
+      name: input.name || "",
+      id: input.id || "",
+      zone: shortText(getAssociatedResumeUploadZone(input)?.textContent || ""),
+      context: shortText(getFileInputContextText(input))
+    }));
+}
+
+function getFileInputContextText(input) {
+  const rootNode = input.getRootNode?.() || document;
+  const forLabel = input.id ? queryOne(`label[for="${cssEscape(input.id)}"]`, rootNode) : null;
+  const container = getFileInputContextContainer(input);
+  return cleanLabel([
+    forLabel?.textContent,
+    input.closest("label")?.textContent,
+    getReferencedText(input, "aria-labelledby", rootNode),
+    getReferencedText(input, "aria-describedby", rootNode),
+    input.getAttribute("aria-label"),
+    input.getAttribute("title"),
+    input.getAttribute("accept"),
+    input.getAttribute("data-testid"),
+    input.getAttribute("data-test"),
+    input.getAttribute("class"),
+    input.name,
+    input.id,
+    container?.textContent,
+    getAssociatedResumeUploadZone(input)?.textContent,
+    getFileInputAncestorLabelCandidates(input).join(" "),
+    getSiblingLabelCandidates(input).join(" ")
+  ].filter(Boolean).join(" "));
+}
+
+function getResumeUploadZoneDebug() {
+  return getResumeUploadZones().map((zone) => ({
+    tag: zone.tagName?.toLowerCase?.() || "",
+    text: shortText(zone.textContent || ""),
+    inputs_inside: queryAll("input[type='file']", zone).length
+  }));
+}
+
+function getResumeUploadZones() {
+  const selector = [
+    "label",
+    "fieldset",
+    "[role='button']",
+    "[class*='upload' i]",
+    "[class*='dropzone' i]",
+    "[class*='drop-zone' i]",
+    "[class*='attachment' i]",
+    "[class*='resume' i]",
+    "[class*='cv' i]",
+    "[data-testid*='upload' i]",
+    "[data-testid*='drop' i]",
+    "[data-testid*='file' i]",
+    "[data-test*='upload' i]",
+    "[data-test*='drop' i]",
+    "[data-test*='file' i]"
+  ].join(",");
+
+  return queryAll(selector)
+    .filter((element) => isVisible(element))
+    .filter((element) => isResumeUploadZoneText(element.textContent || element.getAttribute?.("aria-label") || ""));
+}
+
+function isResumeUploadZoneText(value) {
+  const text = normalize(value);
+  if (!text || isCoverLetterFileText(text)) return false;
+  return (/\b(resume|cv|curriculum vitae)\b/.test(text) &&
+    /\b(upload|attach|attachment|file|drop|drag|browse|choose)\b/.test(text)) ||
+    isGenericApplicationFileUploadText(text);
+}
+
+function isGenericApplicationFileUploadText(value) {
+  const text = normalize(value);
+  if (!text || isCoverLetterFileText(text)) return false;
+  if (/(dropbox|google drive|drive|manual|manually|paste|photo|avatar|image|portfolio|certificate|transcript)/.test(text)) return false;
+  const hasGenericUpload = /\b(choose|select|upload|attach|browse|drop|drag)\b.*\bfile\b|\bfile\b.*\b(drop|upload|attach|browse|choose|select)\b/.test(text);
+  if (!hasGenericUpload) return false;
+  return /\b(easy apply|autocomplete your application|application|personal information|apply|mb size limit|size limit|pdf|doc|docx|rtf|txt)\b/.test(text);
+}
+
+function getAssociatedResumeUploadZone(input) {
+  const direct = input.closest?.([
+    "label",
+    "fieldset",
+    "[class*='upload' i]",
+    "[class*='dropzone' i]",
+    "[class*='drop-zone' i]",
+    "[class*='attachment' i]",
+    "[class*='resume' i]",
+    "[class*='cv' i]",
+    "[data-testid*='upload' i]",
+    "[data-testid*='drop' i]",
+    "[data-testid*='file' i]"
+  ].join(","));
+  if (direct && isResumeUploadZoneText(direct.textContent || direct.getAttribute?.("aria-label") || "")) return direct;
+
+  const zones = getResumeUploadZones();
+  if (zones.length === 0) return null;
+
+  const inputForm = input.closest?.("form");
+  const inputSection = input.closest?.("section, fieldset, main, [role='main'], article, [class*='application' i], [class*='form' i]");
+  const candidates = zones
+    .map((zone) => ({
+      zone,
+      score: scoreResumeUploadZoneAssociation(input, zone, inputForm, inputSection)
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  return candidates[0]?.zone || null;
+}
+
+function scoreResumeUploadZoneAssociation(input, zone, inputForm, inputSection) {
+  if (zone.contains(input)) return 1000;
+  let score = 0;
+  const zoneForm = zone.closest?.("form");
+  const zoneSection = zone.closest?.("section, fieldset, main, [role='main'], article, [class*='application' i], [class*='form' i]");
+  if (inputForm && zoneForm && inputForm === zoneForm) score += 180;
+  if (inputSection && zoneSection && inputSection === zoneSection) score += 80;
+  if (input.parentElement && zone.parentElement && input.parentElement === zone.parentElement) score += 140;
+
+  const zoneInputs = queryAll("input[type='file']", zone);
+  if (zoneInputs.includes(input)) score += 400;
+
+  const sameFormInputs = inputForm ? queryAll("input[type='file']", inputForm).filter((item) => !item.disabled) : [];
+  const sameFormZones = inputForm ? getResumeUploadZones().filter((item) => item.closest?.("form") === inputForm) : [];
+  if (sameFormInputs.length === 1 && sameFormZones.length === 1) score += 120;
+
+  return score;
+}
+
+function getFileInputContextContainer(input) {
+  const direct = input.closest([
+    "label",
+    "fieldset",
+    "[class*='upload' i]",
+    "[class*='dropzone' i]",
+    "[class*='drop-zone' i]",
+    "[class*='file' i]",
+    "[class*='resume' i]",
+    "[class*='cv' i]",
+    "[class*='field' i]",
+    "[data-testid*='upload' i]",
+    "[data-testid*='drop' i]",
+    "[data-testid*='file' i]",
+    ".form-group"
+  ].join(","));
+  if (direct) return direct;
+
+  let current = input.parentElement;
+  for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+    const text = cleanLabel(current.textContent || "");
+    if (text && text.length < 1800 && /(resume|cv|curriculum vitae|upload|attach|drop|drag|browse|choose file|file)/.test(normalize(text))) {
+      return current;
+    }
+  }
+
+  return input.parentElement;
+}
+
+function getReferencedText(element, attribute, rootNode = document) {
+  return String(element.getAttribute(attribute) || "")
+    .split(/\s+/)
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map((id) => rootNode.getElementById?.(id)?.textContent || document.getElementById(id)?.textContent || "")
+    .join(" ");
+}
+
+function getFileInputAncestorLabelCandidates(input) {
+  const candidates = [];
+  let current = input;
+
+  for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+    const label = current.querySelector?.(FIELD_LABEL_SELECTOR);
+    if (label && label !== input && !label.contains(input)) candidates.push(label.textContent);
+
+    let sibling = current.previousElementSibling;
+    for (let index = 0; sibling && index < 4; index += 1, sibling = sibling.previousElementSibling) {
+      const text = cleanLabel(sibling.textContent || "");
+      if (text && text.length < 700 && (isLabelLikeElement(sibling) || /(resume|cv|curriculum vitae|upload|attach|file)/.test(normalize(text)))) {
+        candidates.push(text);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function fileFromBase64(payload) {
+  const filename = sanitizeFilename(payload.filename || payload.name || "resume.pdf");
+  const mimeType = String(payload.mime_type || payload.mimeType || "application/pdf").trim() || "application/pdf";
+  const binary = atob(String(payload.base64 || "").replace(/^data:[^,]+,/, ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], filename, { type: mimeType });
+}
+
+function sanitizeFilename(value) {
+  return String(value || "resume.pdf").replace(/[\\/:*?"<>|]+/g, "_").trim() || "resume.pdf";
+}
+
+async function setFileInputValue(input, file, payload = {}) {
+  try {
+    const nativeResult = await setFileInputValueNatively(input, file, payload);
+    if (nativeResult.attempted) {
+      traceAutoBid("resume:native-upload", {
+        uploaded: nativeResult.uploaded,
+        attached: nativeResult.attached,
+        server_confirmed: nativeResult.server_confirmed,
+        files: nativeResult.files,
+        reason: nativeResult.reason || "",
+        filename: file.name
+      });
+    }
+    if (nativeResult.attached) return true;
+
+    const pageResult = await setFileInputValueInPage(input, file, payload);
+    if (pageResult.attempted) {
+      traceAutoBid("resume:page-upload", {
+        attached: pageResult.attached,
+        server_confirmed: pageResult.server_confirmed,
+        filename: file.name
+      });
+    }
+    if (pageResult.attached) return true;
+
+    const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    dispatchFileInputEvents(input, transfer);
+    dispatchFileDropEvents(input, transfer);
+    return waitForResumeInputConfirmation(
+      input,
+      file.name,
+      RESUME_SERVER_CONFIRM_TIMEOUT_MS,
+      confirmationBefore
+    );
+  } catch (error) {
+    traceAutoBid("resume:set-file-error", { message: error.message || String(error) });
+    return false;
+  }
+}
+
+async function setFileInputValueNatively(input, file, payload) {
+  const localPath = String(payload.local_path || payload.localPath || "").trim();
+  if (!localPath) return { attempted: false, attached: false, reason: "no-local-path" };
+
+  const token = `ab_file_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+  input.setAttribute("data-auto-bid-native-file-token", token);
+  try {
+    const result = await send("NATIVE_FILE_UPLOAD", {
+      token,
+      local_path: localPath,
+      filename: file.name
+    });
+    const attached = await waitForResumeInputConfirmation(
+      input,
+      file.name,
+      RESUME_SERVER_CONFIRM_TIMEOUT_MS,
+      confirmationBefore
+    );
+    return {
+      attempted: true,
+      uploaded: Boolean(result?.uploaded),
+      files: Number(result?.files || input.files?.length || 0),
+      attached,
+      server_confirmed: attached && isServerTrackedResumeInput(input)
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      attached: false,
+      uploaded: false,
+      reason: error.message || String(error)
+    };
+  } finally {
+    window.setTimeout(() => {
+      if (input.getAttribute("data-auto-bid-native-file-token") === token) {
+        input.removeAttribute("data-auto-bid-native-file-token");
+      }
+    }, 1200);
+  }
+}
+
+async function setFileInputValueInPage(input, file, payload) {
+  const filePayload = {
+    name: file.name,
+    mime_type: file.type || payload.mime_type || payload.mimeType || "application/pdf",
+    base64: String(payload.base64 || "").replace(/^data:[^,]+,/, "")
+  };
+  if (!filePayload.base64) return { attempted: false, attached: false };
+
+  const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+  const acknowledged = runPageCommand("file-upload", input, { file: filePayload });
+  if (!acknowledged) return { attempted: false, attached: false };
+
+  const attached = await waitForResumeInputConfirmation(
+    input,
+    file.name,
+    RESUME_SERVER_CONFIRM_TIMEOUT_MS,
+    confirmationBefore
+  );
+  return {
+    attempted: true,
+    attached,
+    server_confirmed: attached && isServerTrackedResumeInput(input)
+  };
+}
+
+function dispatchFileInputEvents(input, transfer) {
+  input.focus?.();
+  ["input", "change"].forEach((type) => {
+    const event = new Event(type, { bubbles: true, cancelable: true, composed: true });
+    defineEventDataTransfer(event, transfer);
+    input.dispatchEvent(event);
+  });
+  input.blur?.();
+}
+
+function dispatchFileDropEvents(input, transfer) {
+  const targets = getFileDropTargets(input);
+  targets.forEach((target) => {
+    ["dragenter", "dragover", "drop"].forEach((type) => {
+      const event = createDragEvent(type, transfer);
+      target.dispatchEvent(event);
+    });
+  });
+}
+
+function getFileDropTargets(input) {
+  return Array.from(new Set([
+    getAssociatedResumeUploadZone(input),
+    getFileInputContextContainer(input),
+    input.closest?.("label"),
+    input.parentElement,
+    input
+  ].filter(Boolean)));
+}
+
+function createDragEvent(type, transfer) {
+  try {
+    return new DragEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      dataTransfer: transfer
+    });
+  } catch {
+    const event = new Event(type, { bubbles: true, cancelable: true, composed: true });
+    defineEventDataTransfer(event, transfer);
+    return event;
+  }
+}
+
+function defineEventDataTransfer(event, transfer) {
+  try {
+    Object.defineProperty(event, "dataTransfer", { value: transfer });
+  } catch {
+    // Some browser events already expose dataTransfer.
+  }
+}
+
+function hasUploadedFileUi(input, filename) {
+  if (hasServerConfirmedResumeUpload(input, filename)) return true;
+  const text = normalize([
+    getFileInputContextText(input),
+    getAssociatedResumeUploadZone(input)?.textContent
+  ].filter(Boolean).join(" "));
+  const name = normalize(filename);
+  return Boolean(name && text.includes(name));
+}
+
+function hasResumeUploadedUi(filename) {
+  const name = normalize(filename);
+  if (!name) return false;
+
+  if (getResumeFileInputs().some((input) => hasServerConfirmedResumeUpload(input, filename))) return true;
+
+  const zones = getResumeUploadZones();
+  if (zones.some((zone) => normalize(zone.textContent || "").includes(name))) return true;
+
+  const form = queryOne("form") || document.body;
+  const text = normalize(form?.textContent || "");
+  return text.includes(name);
+}
+
+function isResumeInputAttached(input) {
+  if (!input) return false;
+  if (hasServerConfirmedResumeUpload(input)) return true;
+  if (isServerTrackedResumeInput(input)) return false;
+  return Boolean(input.files?.length) || hasUploadedFileUi(input, input.files?.[0]?.name || "");
+}
+
+async function waitForResumeInputConfirmation(input, filename, timeoutMs, confirmationBefore = []) {
+  const requiresServerConfirmation = isServerTrackedResumeInput(input);
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    if (hasNewServerConfirmedResumeUpload(input, filename, confirmationBefore)) return true;
+    if (!requiresServerConfirmation &&
+        (Boolean(input.files?.length) || hasUploadedFileUi(input, filename))) {
+      return true;
+    }
+    await sleep(200);
+  }
+
+  return hasNewServerConfirmedResumeUpload(input, filename, confirmationBefore) ||
+    !requiresServerConfirmation &&
+      (Boolean(input.files?.length) || hasUploadedFileUi(input, filename));
+}
+
+async function waitForAnyResumeUploadConfirmation(filename, nativeUploaded, timeoutMs, confirmationBefore = []) {
+  const started = Date.now();
+  let inputs = getResumeFileInputs();
+  const serverTracked = inputs.some(isServerTrackedResumeInput) || hasServerTrackedResumeUploadZone();
+
+  while (Date.now() - started < timeoutMs) {
+    inputs = getResumeFileInputs();
+    if (hasNewResumeServerConfirmation(filename, confirmationBefore)) {
+      return true;
+    }
+    if (!serverTracked && inputs.some((input) => isResumeInputAttached(input))) return true;
+    if (!serverTracked && (nativeUploaded || hasResumeUploadedUi(filename))) return true;
+    await sleep(200);
+  }
+
+  return hasNewResumeServerConfirmation(filename, confirmationBefore) ||
+    !serverTracked && inputs.some(isResumeInputAttached) ||
+    !serverTracked && (nativeUploaded || hasResumeUploadedUi(filename));
+}
+
+function hasServerTrackedResumeUploadZone() {
+  return queryAll("spl-dropzone, [data-test*='apply-with-resume' i], [data-testid*='apply-with-resume' i]")
+    .some((element) => !isCoverLetterFileText(element.textContent || ""));
+}
+
+function isServerTrackedResumeInput(input) {
+  return getResumeUploadComponentElements(input).some((element) =>
+    normalize(element.tagName || "") === "spl dropzone" ||
+    /apply-with-resume/.test(normalize([
+      element.getAttribute?.("data-test"),
+      element.getAttribute?.("data-testid"),
+      element.tagName
+    ].filter(Boolean).join(" ")))
+  );
+}
+
+function hasServerConfirmedResumeUpload(input, filename = "") {
+  const expectedName = normalize(filename);
+  return getResumeUploadComponentFileMetadata(input).some((metadata) => {
+    const text = normalize(metadata);
+    if (expectedName && !text.includes(expectedName)) return false;
+    return /fileid|file id|attachmenttype|attachment type|uploaded/.test(text);
+  });
+}
+
+function hasNewServerConfirmedResumeUpload(input, filename, confirmationBefore = []) {
+  const previous = new Set((confirmationBefore || []).map(String));
+  const expectedName = normalize(filename);
+  return getResumeUploadComponentFileMetadata(input).some((metadata) => {
+    if (previous.has(String(metadata))) return false;
+    const text = normalize(metadata);
+    if (expectedName && !text.includes(expectedName)) return false;
+    return /fileid|file id|attachmenttype|attachment type|uploaded/.test(text);
+  });
+}
+
+function hasNewResumeServerConfirmation(filename, confirmationBefore = []) {
+  const previous = new Set((confirmationBefore || []).map(String));
+  const expectedName = normalize(filename);
+  return getResumeServerConfirmationSnapshot().some((metadata) => {
+    if (previous.has(String(metadata))) return false;
+    const text = normalize(metadata);
+    if (expectedName && !text.includes(expectedName)) return false;
+    return /fileid|file id|attachmenttype|attachment type|uploaded/.test(text);
+  });
+}
+
+function getResumeServerConfirmationSnapshot() {
+  const metadata = queryAll("input[type='file']")
+    .flatMap(getResumeUploadComponentFileMetadata);
+  queryAll("spl-dropzone, [data-test*='apply-with-resume' i], [data-testid*='apply-with-resume' i]")
+    .forEach((element) => {
+      ["files", "data-files", "attachments", "data-attachments"].forEach((attribute) => {
+        const value = element.getAttribute?.(attribute);
+        if (value) metadata.push(String(value));
+      });
+    });
+  return uniqueNonEmptyValues(metadata);
+}
+
+function getResumeInputAttachedFilenames(input) {
+  const names = [];
+  if (input?.files?.length) {
+    names.push(...Array.from(input.files).map((file) => file.name).filter(Boolean));
+  }
+
+  for (const metadata of getResumeUploadComponentFileMetadata(input)) {
+    try {
+      const parsed = JSON.parse(metadata);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      items.forEach((item) => {
+        const name = item?.fileName || item?.filename || item?.name || "";
+        if (name) names.push(String(name));
+      });
+    } catch (_error) {
+      const match = metadata.match(/(?:fileName|filename|name)["']?\s*[:=]\s*["']([^"']+)/i);
+      if (match?.[1]) names.push(match[1]);
+    }
+  }
+
+  return uniqueNonEmptyValues(names);
+}
+
+function getResumeUploadComponentFileMetadata(input) {
+  const values = [];
+  for (const element of getResumeUploadComponentElements(input)) {
+    ["files", "data-files", "attachments", "data-attachments"].forEach((attribute) => {
+      const value = element.getAttribute?.(attribute);
+      if (value) values.push(String(value));
+    });
+
+    const propertyValue = element !== input ? element.files || element.attachments : null;
+    if (propertyValue && !(propertyValue instanceof FileList)) {
+      try {
+        values.push(typeof propertyValue === "string" ? propertyValue : JSON.stringify(propertyValue));
+      } catch (_error) {
+        // Attribute metadata is sufficient when a component property is not serializable.
+      }
+    }
+  }
+  return uniqueNonEmptyValues(values);
+}
+
+function getResumeUploadComponentElements(input) {
+  const elements = [];
+  let current = input;
+  for (let depth = 0; current && depth < 14; depth += 1) {
+    if (!elements.includes(current)) elements.push(current);
+    if (current.parentElement) {
+      current = current.parentElement;
+      continue;
+    }
+    const root = current.getRootNode?.();
+    current = root?.host || null;
+  }
+  return elements;
+}
+
+function summarizeResumePayload(payload) {
+  if (!payload) return null;
+  return {
+    row_number: payload.row_number || payload.rowNumber || null,
+    filename: payload.filename || payload.name || "",
+    mime_type: payload.mime_type || payload.mimeType || "",
+    size: payload.size || payload.bytes || 0,
+    source_url: payload.source_url || payload.url || "",
+    local_path: payload.local_path || payload.localPath || "",
+    refreshed: Boolean(payload.refreshed),
+    reason: payload.reason || ""
+  };
+}
+
+async function applySheetAnswerExchange(fields, filledIds) {
+  const localFilledIds = new Set();
+  const page = collectPageContext();
+  let context = null;
+
+  try {
+    context = await send("SHEET_CONTEXT", { page, url: page.url });
+  } catch (error) {
+    traceAutoBid("sheet:context-error", { message: error.message || String(error) });
+    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+  }
+
+  if (!context?.rowNumber) {
+    traceAutoBid("sheet:no-context", { url: page.url });
+    showStatus("No matching Google Sheet row found for this page.", "error");
+    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+  }
+
+  traceAutoBid("sheet:context-found", {
+    row_number: context.rowNumber,
+    sheet_name: context.sheetName || "",
+    url: context.url || page.url,
+    match_source: context.matchSource || ""
+  });
+
+  const candidateFields = getSheetQuestionCandidateFields(fields, filledIds);
+  if (candidateFields.length === 0) {
+    traceAutoBid("sheet:no-candidates", {
+      row_number: context.rowNumber,
+      fields: fields.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        type: field.type,
+        current: shortText(getCurrentChoiceSummary(getControlsByFieldId(field.id)) || field.value || ""),
+        reason: getSheetCandidateSkipReason(field, filledIds)
+      }))
+    });
+    showStatus("No unanswered generated-answer fields found for this page.", "success");
+    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+  }
+
+  traceAutoBid("sheet:candidates", {
+    row_number: context.rowNumber,
+    count: candidateFields.length,
+    fields: candidateFields.map((field) => ({
+      field_id: field.id,
+      label: field.label,
+      type: field.type
+    }))
+  });
+
+  const candidateIds = new Set(candidateFields.map((field) => field.id));
+  let totalFilled = 0;
+  let totalMissed = 0;
+  const activeFilledIds = new Set(filledIds);
+
+  const applySheetAnswers = async (data, stage) => {
+    const answers = normalizeSheetAnswers(data)
+      .filter((answer) => candidateIds.has(answer.field_id))
+      .filter((answer) => !hasFieldCurrentValue(fields.find((field) => field.id === answer.field_id)));
+    if (answers.length === 0) return { filled: 0, missed: 0, filledIds: new Set() };
+
+    traceAutoBid("sheet:answers-received", {
+      stage,
+      row_number: context.rowNumber,
+      answers: answers.map((answer) => ({
+        field_id: answer.field_id,
+        value: shortText(answer.value)
+      }))
+    });
+
+    const result = await applyAnswers(answers, activeFilledIds, fields);
+    result.filledIds.forEach((fieldId) => {
+      localFilledIds.add(fieldId);
+      activeFilledIds.add(fieldId);
+    });
+    totalFilled += result.filled;
+    totalMissed += result.missed;
+    return result;
+  };
+
+  let remaining = candidateFields.filter((field) => !activeFilledIds.has(field.id) && !hasFieldCurrentValue(field));
+  if (remaining.length === 0) {
+    return { filled: totalFilled, missed: totalMissed, pending: 0, filledIds: localFilledIds };
+  }
+
+  const profileContext = await getGeneratedAnswerProfileContext();
+  const payload = buildSheetQuestionPayload(page, context, remaining, profileContext);
+  try {
+    await send("SHEET_SUBMIT_QUESTIONS", { context, page, payload });
+    traceAutoBid("sheet:questions-sent", {
+      row_number: context.rowNumber,
+      fields: remaining.map((field) => ({
+        field_id: field.id,
+        question: field.question || field.label,
+        option: field.option || "",
+        type: field.type,
+        options: field.options || []
+      }))
+    });
+    showStatus(`Sent ${remaining.length} question${remaining.length === 1 ? "" : "s"} to Google Sheet`, "success");
+    triggerSheetGptAnswerWorker(context).catch((error) => {
+      traceAutoBid("sheet:gpt-worker-trigger-error", { message: error.message || String(error) });
+    });
+  } catch (error) {
+    traceAutoBid("sheet:submit-error", { message: error.message || String(error) });
+    return { filled: totalFilled, missed: totalMissed, pending: remaining.length, filledIds: localFilledIds };
+  }
+
+  await sleep(SHEET_ANSWER_FIRST_WAIT_MS);
+
+  for (let attempt = 1; attempt <= SHEET_ANSWER_RETRY_ATTEMPTS; attempt += 1) {
+
+    try {
+      const data = await send("SHEET_FETCH_ANSWERS", { context, page });
+      await applySheetAnswers(data, attempt === 1 ? "after-wait" : `retry-${attempt - 1}`);
+      remaining = candidateFields.filter((field) => !activeFilledIds.has(field.id) && !hasFieldCurrentValue(field));
+      traceAutoBid("sheet:read", {
+        row_number: context.rowNumber,
+        attempt,
+        remaining: remaining.length
+      });
+      if (remaining.length === 0) break;
+    } catch (error) {
+      traceAutoBid("sheet:fetch-error", { stage: `read-${attempt}`, message: error.message || String(error) });
+    }
+
+    if (attempt < SHEET_ANSWER_RETRY_ATTEMPTS) await sleep(SHEET_ANSWER_RETRY_MS);
+  }
+
+  if (remaining.length > 0) {
+    traceAutoBid("sheet:answers-pending", {
+      row_number: context.rowNumber,
+      remaining: remaining.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        type: field.type
+      }))
+    });
+    showStatus(`${remaining.length} Sheet answer${remaining.length === 1 ? "" : "s"} still pending.`, "success");
+  }
+
+  return { filled: totalFilled, missed: totalMissed, pending: remaining.length, filledIds: localFilledIds };
+}
+
+async function applyRuntimeGptAnswerExchange(fields, filledIds) {
+  const localFilledIds = new Set();
+  const page = collectPageContext();
+  const context = await getSheetContextForRuntime(page);
+
+  const candidateFields = getSheetQuestionCandidateFields(fields, filledIds);
+  if (candidateFields.length === 0) {
+    traceAutoBid("runtime-gpt:no-candidates", {
+      fields: fields.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        type: field.type,
+        current: shortText(getCurrentChoiceSummary(getControlsByFieldId(field.id)) || field.value || ""),
+        reason: getSheetCandidateSkipReason(field, filledIds)
+      }))
+    });
+    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+  }
+
+  await hydrateGeneratedChoiceOptions(candidateFields);
+
+  const candidateIds = new Set(candidateFields.map((field) => field.id));
+  const activeFilledIds = new Set(filledIds);
+  let remaining = candidateFields.filter((field) => !activeFilledIds.has(field.id) && !hasFieldCurrentValue(field));
+  if (remaining.length === 0) {
+    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+  }
+
+  const profileContext = await getGeneratedAnswerProfileContext();
+  const payload = buildSheetQuestionPayload(page, context, remaining, profileContext);
+  traceAutoBid("runtime-gpt:request", {
+    row_number: context.rowNumber || null,
+    sheet_name: context.sheetName || "",
+    fields: remaining.map((field) => ({
+      field_id: field.id,
+      question: field.question || field.label,
+      option: field.option || "",
+      type: field.type,
+      options: field.options || []
+    }))
+  });
+
+  let request;
+  try {
+    request = await send("GPT_ANSWER_REQUEST", {
+      context,
+      page,
+      payload,
+      timeout_ms: RUNTIME_GPT_ANSWER_TIMEOUT_MS,
+      max_attempts: 1
+    });
+  } catch (error) {
+    traceAutoBid("runtime-gpt:start-error", { message: error.message || String(error) });
+    return { filled: 0, missed: 0, pending: remaining.length, filledIds: localFilledIds };
+  }
+
+  const requestId = request?.request_id || request?.requestId || "";
+  if (requestId) runtimeGptSourceFields.set(requestId, remaining.map((field) => ({ ...field })));
+  showStatus(`Sent ${remaining.length} question${remaining.length === 1 ? "" : "s"} to ChatGPT worker`, "success");
+
+  const status = await waitForRuntimeGptAnswer(requestId);
+  if (status?.status === "error") {
+    traceAutoBid("runtime-gpt:error", {
+      request_id: status.request_id || status.requestId || "",
+      message: status.error || ""
+    });
+    return { filled: 0, missed: remaining.length, pending: 0, request_id: requestId, filledIds: localFilledIds };
+  }
+
+  if (status?.status !== "complete") {
+    traceAutoBid("runtime-gpt:pending", {
+      request_id: requestId,
+      status: status?.status || "timeout",
+      remaining: remaining.length
+    });
+    return { filled: 0, missed: 0, pending: remaining.length, request_id: requestId, filledIds: localFilledIds };
+  }
+
+  const answers = normalizeRuntimeGptAnswers(status)
+    .filter((answer) => candidateIds.has(answer.field_id));
+
+  if (answers.length === 0) {
+    traceAutoBid("runtime-gpt:no-usable-answers", {
+      request_id: status.request_id || status.requestId || "",
+      answers: Array.isArray(status.answers) ? status.answers.length : 0
+    });
+    return { filled: 0, missed: remaining.length, pending: 0, filledIds: localFilledIds };
+  }
+
+  traceAutoBid("runtime-gpt:answers-received", {
+    request_id: status.request_id || status.requestId || "",
+    answers: answers.map((answer) => ({
+      field_id: answer.field_id,
+      value: shortText(answer.value)
+    }))
+  });
+
+  const result = await applyRuntimeGptAnswersOnce(requestId, answers, remaining, activeFilledIds);
+  result.filledIds.forEach((fieldId) => localFilledIds.add(fieldId));
+  remaining = candidateFields.filter((field) => !result.filledIds.has(field.id) && !hasFieldCurrentValue(field));
+
+  return {
+    filled: result.filled,
+    missed: result.missed,
+    pending: 0,
+    remaining: remaining.length,
+    request_id: requestId,
+    filledIds: localFilledIds
+  };
+}
+
+async function applyPushedRuntimeGptAnswers(payload) {
+  const requestId = String(payload.request_id || payload.requestId || "");
+  if (!requestId) return emptyFillResult();
+
+  if (!runtimeGptSourceFields.has(requestId) && Array.isArray(payload.fields)) {
+    runtimeGptSourceFields.set(requestId, payload.fields.map((field) => ({
+      ...field,
+      id: String(field.id || field.field_id || "")
+    })).filter((field) => field.id));
+  }
+
+  const answers = normalizeRuntimeGptAnswers({ answers: payload.answers || [] });
+  traceAutoBid("runtime-gpt:push-received", {
+    request_id: requestId,
+    answers: answers.map((answer) => ({
+      field_id: answer.field_id,
+      value: shortText(answer.value)
+    }))
+  });
+  if (answers.length === 0) return emptyFillResult();
+
+  const result = await applyRuntimeGptAnswersOnce(requestId, answers);
+  const settlement = getRuntimeGptAnswerSettlement(requestId);
+  traceAutoBid("runtime-gpt:push-applied", {
+    request_id: requestId,
+    filled: result.filled,
+    missed: result.missed,
+    settlement
+  });
+  if (settlement.settled) {
+    await acknowledgeRuntimeGptAnswersApplied(requestId, {
+      ...result,
+      exhausted: settlement.exhausted
+    }).catch(() => {});
+  }
+  flushTrace();
+  return {
+    filled: Number(result.filled || 0),
+    missed: Number(result.missed || 0),
+    applied: result.filled > 0,
+    settled: settlement.settled,
+    exhausted: settlement.exhausted,
+    pending: settlement.pending
+  };
+}
+
+function getRuntimeGptAnswerSettlement(requestId) {
+  const answers = runtimeGptAnswersByRequest.get(requestId) || [];
+  const sourceFields = runtimeGptSourceFields.get(requestId) || [];
+  const sourceById = new Map(sourceFields.map((field) => [field.id, field]));
+  let filled = 0;
+  let exhausted = 0;
+  let pending = 0;
+
+  for (const answer of answers) {
+    const sourceField = sourceById.get(answer.field_id) || null;
+    const binding = resolveLiveFieldForAnswer(answer, sourceField);
+    const field = binding?.field || sourceField;
+    if (binding && hasFieldCurrentValue(binding.field, binding.controls)) {
+      filled += 1;
+      continue;
+    }
+
+    const attempts = getGeneratedAnswerFillAttempts(getGeneratedAnswerAttemptKey(answer, field));
+    if (attempts >= MAX_FIELD_FILL_ATTEMPTS) exhausted += 1;
+    else pending += 1;
+  }
+
+  return {
+    settled: answers.length > 0 && pending === 0,
+    filled,
+    exhausted,
+    pending,
+    max_attempts: MAX_FIELD_FILL_ATTEMPTS
+  };
+}
+
+function applyRuntimeGptAnswersOnce(requestId, rawAnswers, fallbackFields = [], skipFilledIds = new Set()) {
+  if (runtimeGptApplyPromises.has(requestId)) return runtimeGptApplyPromises.get(requestId);
+
+  const promise = (async () => {
+    const sourceFields = runtimeGptSourceFields.get(requestId) || fallbackFields || [];
+    const sourceIds = new Set(sourceFields.map((field) => field.id));
+    const answers = normalizeRuntimeGptAnswers({ answers: rawAnswers || [] })
+      .filter((answer) => sourceIds.size === 0 || sourceIds.has(answer.field_id));
+    if (answers.length === 0) return emptyFillResult();
+
+    runtimeGptAnswersByRequest.set(requestId, answers);
+    return applyAnswers(answers, skipFilledIds, sourceFields);
+  })().finally(() => {
+    runtimeGptApplyPromises.delete(requestId);
+  });
+
+  runtimeGptApplyPromises.set(requestId, promise);
+  return promise;
+}
+
+function acknowledgeRuntimeGptAnswersApplied(requestId, result) {
+  return send("GPT_ANSWER_APPLIED", {
+    request_id: requestId,
+    result: {
+      filled: Number(result?.filled || 0),
+      missed: Number(result?.missed || 0),
+      applied_at: new Date().toISOString()
+    }
+  });
+}
+
+async function getSheetContextForRuntime(page) {
+  try {
+    const context = await promiseWithTimeout(
+      send("SHEET_CONTEXT", { page, url: page.url }),
+      SHEET_CONTEXT_TIMEOUT_MS,
+      "Sheet context lookup timed out"
+    );
+    if (context?.rowNumber) {
+      traceAutoBid("runtime-gpt:context-found", {
+        row_number: context.rowNumber,
+        sheet_name: context.sheetName || "",
+        url: context.url || page.url,
+        match_source: context.matchSource || ""
+      });
+      return context;
+    }
+  } catch (error) {
+    traceAutoBid("runtime-gpt:context-error", { message: error.message || String(error) });
+  }
+
+  traceAutoBid("runtime-gpt:no-sheet-context", { url: page.url });
+  return {
+    rowNumber: null,
+    sheetName: "",
+    spreadsheetId: "",
+    url: page.url,
+    values: {},
+    raw: []
+  };
+}
+
+async function waitForRuntimeGptAnswer(requestId) {
+  if (!requestId) return { status: "error", error: "Missing runtime GPT request id" };
+
+  const started = Date.now();
+  while (Date.now() - started < RUNTIME_GPT_ANSWER_TIMEOUT_MS) {
+    let status;
+    try {
+      status = await send("GPT_ANSWER_STATUS", { request_id: requestId });
+    } catch (error) {
+      traceAutoBid("runtime-gpt:status-error", { request_id: requestId, message: error.message || String(error) });
+      return { status: "error", error: error.message || String(error) };
+    }
+
+    if (status?.status === "complete" || status?.status === "error") return status;
+    await sleep(RUNTIME_GPT_ANSWER_POLL_MS);
+  }
+
+  try {
+    const finalStatus = await send("GPT_ANSWER_STATUS", { request_id: requestId });
+    if (finalStatus?.status === "complete" || finalStatus?.status === "error") return finalStatus;
+  } catch (error) {
+    traceAutoBid("runtime-gpt:final-status-error", { request_id: requestId, message: error.message || String(error) });
+  }
+
+  traceAutoBid("runtime-gpt:wait-timeout-queue-preserved", { request_id: requestId });
+  return { status: "timeout", request_id: requestId, queued: true };
+}
+
+async function maybeAutoSubmitApplication(fields, sheetResult, resumeResult) {
+  if (!sheetResult || sheetResult.filled <= 0) {
+    traceAutoBid("submit:checking-without-generated-fill", { reason: "no-generated-answers-filled" });
+  }
+
+  if (sheetResult.pending > 0) {
+    traceAutoBid("submit:sheet-pending-after-fallback", { pending: sheetResult.pending });
+  }
+
+  if (resumeResult?.missed > 0 && hasMissingRequiredResumeUpload(fields)) {
+    traceAutoBid("submit:skipped", { reason: "resume-attach-missed", resume: resumeResult });
+    return { clicked: false, reason: "resume-attach-missed" };
+  }
+
+  await sleep(900);
+
+  const missingRequired = getMissingRequiredFields(fields);
+  if (missingRequired.length > 0) {
+    traceAutoBid("submit:skipped", {
+      reason: "required-fields-missing",
+      missing: missingRequired.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        type: field.type
+      }))
+    });
+    return { clicked: false, reason: "required-fields-missing", missing: missingRequired.length };
+  }
+
+  const button = await waitForApplicationSubmitButton();
+  if (!button) {
+    traceAutoBid("submit:skipped", { reason: "button-not-found" });
+    return { clicked: false, reason: "button-not-found" };
+  }
+
+  if (isDisabledSubmitButton(button)) {
+    traceAutoBid("submit:skipped", {
+      reason: "button-disabled",
+      text: getSubmitButtonText(button)
+    });
+    return { clicked: false, reason: "button-disabled", text: getSubmitButtonText(button) };
+  }
+
+  await scrollElementIntoView(button, "center");
+  await sleep(250);
+  let clicked = await nativeClickElement(button);
+  if (!clicked) {
+    dispatchRealisticMouseClick(button);
+    clicked = true;
+  }
+  await sleep(600);
+
+  traceAutoBid("submit:clicked", {
+    clicked: Boolean(clicked),
+    text: getSubmitButtonText(button)
+  });
+
+  return { clicked: Boolean(clicked), reason: clicked ? "submitted" : "click-failed", text: getSubmitButtonText(button) };
+}
+
+async function triggerSheetGptAnswerWorker(context) {
+  const result = await send("RUN_GPT_ANSWER", {
+    mode: "once",
+    rowNumber: context?.rowNumber || null,
+    sheetName: context?.sheetName || ""
+  });
+  traceAutoBid("sheet:gpt-worker-triggered", {
+    row_number: context?.rowNumber || null,
+    result
+  });
+  return result;
+}
+
+function getMissingRequiredFields(fields) {
+  return (fields || []).filter((field) => {
+    if (!field.required) return false;
+    if (field.type === "file") return !hasRequiredFileFieldValue(field);
+    if (isGeneratedAnswerIgnoredFieldType(field.type)) return false;
+    const controls = getControlsByFieldId(field.id);
+    return controls.length > 0 && !hasFieldCurrentValue(field, controls);
+  });
+}
+
+function hasMissingRequiredResumeUpload(fields) {
+  return (fields || []).some((field) => field.required && field.type === "file" && isResumeUploadField(field) && !hasRequiredFileFieldValue(field));
+}
+
+function hasRequiredFileFieldValue(field) {
+  const controls = getControlsByFieldId(field.id);
+  if (controls.some((control) => control.files?.length)) return true;
+  return hasResumeUploadedUi("");
+}
+
+function isResumeUploadField(field) {
+  const text = normalize([field.question, field.label, field.option, field.name, field.placeholder].filter(Boolean).join(" "));
+  return /\b(resume|cv|curriculum vitae)\b/.test(text);
+}
+
+function findApplicationSubmitButton() {
+  const candidates = queryAll("button, input[type='submit'], input[type='button'], [role='button'], a")
+    .filter((element) => isVisible(element))
+    .map((element) => ({
+      element,
+      text: normalize(getSubmitButtonText(element)),
+      disabled: isDisabledSubmitButton(element)
+    }))
+    .filter((candidate) => candidate.text && !isNonSubmitActionText(candidate.text))
+    .filter((candidate) => isLikelyFinalApplicationSubmit(candidate.element, candidate.text))
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreSubmitButton(candidate.text, candidate.disabled)
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  return candidates[0]?.element || null;
+}
+
+async function waitForApplicationSubmitButton(timeoutMs = 8000) {
+  const started = Date.now();
+  let lastButton = null;
+
+  while (Date.now() - started < timeoutMs) {
+    const button = findApplicationSubmitButton();
+    if (button) {
+      lastButton = button;
+      if (!isDisabledSubmitButton(button)) return button;
+    }
+    await sleep(400);
+  }
+
+  return lastButton;
+}
+
+function getSubmitButtonText(element) {
+  return cleanLabel([
+    element?.textContent,
+    element?.value,
+    element?.getAttribute?.("aria-label"),
+    element?.getAttribute?.("title")
+  ].filter(Boolean).join(" "));
+}
+
+function isDisabledSubmitButton(element) {
+  return Boolean(
+    element?.disabled ||
+    element?.getAttribute?.("aria-disabled") === "true" ||
+    element?.matches?.("[disabled], .disabled, [class*='disabled' i]")
+  );
+}
+
+function isNonSubmitActionText(text) {
+  return /^apply!?$/.test(text) ||
+    /(attach|upload|browse|choose file|clear|remove|delete|cancel|back|previous|save draft|google drive|enter manually|view website|view all jobs|help|login|sign up|log out)/.test(text);
+}
+
+function isLikelyFinalApplicationSubmit(element, text) {
+  if (/(submit application|submit my application|send application|send my application)/.test(text)) return true;
+  if (/(submit|send)/.test(text) && isElementNearApplicationForm(element)) return true;
+  if (/(apply now|apply for this job)/.test(text) && isElementNearApplicationForm(element)) return true;
+  if (/(continue|next)/.test(text) && /(application|submit|review)/.test(text) && isElementNearApplicationForm(element)) return true;
+  return false;
+}
+
+function isElementNearApplicationForm(element) {
+  const form = element.closest?.("form");
+  if (form && queryAll("input, textarea, select, [role='checkbox'], [role='radio'], [role='combobox']", form).length > 0) return true;
+
+  const container = element.closest?.("main, section, article, [class*='application' i], [class*='apply' i], [class*='form' i]") || document.body;
+  const text = normalize(container?.textContent || "");
+  const controls = queryAll("input, textarea, select, [role='checkbox'], [role='radio'], [role='combobox']", container)
+    .filter((control) => isVisible(control));
+  return controls.length > 0 &&
+    /(required|resume|cv|cover letter|privacy|consent|first name|last name|email|phone|submit application)/.test(text);
+}
+
+function scoreSubmitButton(text, disabled) {
+  let score = disabled ? -20 : 0;
+  if (/(submit application|submit my application|send application|send my application)/.test(text)) score += 120;
+  else if (/(apply now|apply for this job|submit|send application)/.test(text)) score += 100;
+  else if (/^apply$|^send$/.test(text)) score += 80;
+  else if (/(continue|next)/.test(text) && /(application|submit|review)/.test(text)) score += 50;
+  return score;
+}
+
+function getSheetQuestionCandidateFields(fields, filledIds) {
+  return getGeneratedAnswerCandidateFields(fields, filledIds);
+}
+
+function getSheetCandidateSkipReason(field, filledIds) {
+  return getGeneratedAnswerCandidateSkipReason(field, filledIds);
+}
+
+function getGeneratedAnswerCandidateFields(fields, filledIds) {
+  return fields.filter((field) => !getGeneratedAnswerCandidateSkipReason(field, filledIds));
+}
+
+async function hydrateGeneratedChoiceOptions(fields) {
+  for (const field of fields) {
+    if (!field || field.options?.length > 0 || field.type !== "combobox") continue;
+    const controls = getControlsByFieldId(field.id);
+    const control = controls[0];
+    if (!control || hasFieldCurrentValue(field, controls)) continue;
+
+    await clearComboboxSearchValue(control);
+    const options = await getComboboxChoices(control);
+    field.options = uniqueNonEmptyValues(options.map((option) => cleanLabel(
+      option.textContent || option.getAttribute("data-value") || option.getAttribute("value") || ""
+    )));
+    traceAutoBid("ai:choice-options-hydrated", {
+      field_id: field.id,
+      label: field.label,
+      options: field.options
+    });
+    await closeCombobox(control);
+  }
+}
+
+function getGeneratedAnswerCandidateSkipReason(field, _filledIds) {
+  if (!field?.id) return "missing-field-id";
+  if (isGeneratedAnswerIgnoredFieldType(field.type)) return "ignored-field-type";
+  if (!field.required) return "not-required";
+  if (isSensitiveGeneratedAnswerField(field)) return "sensitive-field";
+  if (isProfileStaticQuestionField(field)) return "profile-static-field";
+
+  const controls = getControlsByFieldId(field.id);
+  if (controls.length === 0) return "control-not-found";
+  if (hasFieldCurrentValue(field, controls)) return "already-has-value";
+
+  return "";
+}
+
+function isGeneratedAnswerIgnoredFieldType(type) {
+  return ["file", "hidden", "password", "submit", "button", "reset", "image"].includes(type);
+}
+
+function isSensitiveGeneratedAnswerField(field) {
+  const text = normalize([field.question, field.label, field.option, field.name, field.placeholder].filter(Boolean).join(" "));
+  return /(captcha|recaptcha|one time|otp|verification code|coupon|promo|password|gender|race|ethnicity|ethnic|disability|veteran|protected veteran|sexual orientation|date of birth|birth date|national id|social security|ssn|passport)/.test(text);
+}
+
+function isProfileStaticQuestionField(field) {
+  const prompt = normalize(field.question || field.label || field.name || field.placeholder || "");
+  const metadata = normalize([field.name, field.placeholder, field.autocomplete].filter(Boolean).join(" "));
+  if (!prompt && !metadata) return false;
+
+  if (/(experience|years|skill|proficiency|technology|framework|develop|authorization|authorisation|authorized|authorised|visa|sponsor|sponsorship|work permit|right to work|relocat|willing|comfortable|why|describe|explain)/.test(prompt)) {
+    return false;
+  }
+
+  if (field.type === "email" || /^(email|e mail)$/.test(normalize(field.autocomplete || ""))) return true;
+  if (field.type === "tel" || /^(tel|phone|mobile)$/.test(normalize(field.autocomplete || ""))) return true;
+
+  const contactPrompt = /^(?:(?:what is|please enter|please provide|enter|provide|type|select)\s+)?(?:your\s+)?(?:first name|given name|last name|family name|surname|full name|name|email(?: address)?|e mail(?: address)?|phone(?: number)?|mobile(?: number)?|telephone(?: number)?|linkedin(?: profile)?(?: url| link)?|github(?: profile)?(?: url| link)?|portfolio(?: url| link)?|personal (?:site|website)(?: url| link)?|website url|profile url)\b/;
+  if (contactPrompt.test(prompt)) return true;
+
+  const locationPrompt = /^(?:(?:what is|please enter|please provide|enter|provide|type|select)\s+)?(?:your\s+)?(?:current\s+)?(?:city|country|country of residence|location|address|residence|postal code|post code|postcode|zip code|state|province|region|state province region)\b|^where (?:are|do) you (?:currently )?(?:live|reside|located|based)\b|^where is your current residence\b/;
+  if (locationPrompt.test(prompt)) return true;
+
+  return /^(first name|last name|full name|email|phone|mobile|city|country|location|address|postal code|postcode|zip code|state|province|region|state region|linkedin|github|portfolio|website)(?: id| field| input)?$/.test(metadata);
+}
+
+function isLocallyAnswerableGeneratedField(field) {
+  const text = normalize([field.question, field.label, field.option, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!text) return false;
+  return /(terms|privacy|policy|consent|agree|accept|acknowledge|confirm|certify|accurate|contact me|future job opportunit|future opportunit|talent community|job alert|recruiting communication|recruitment communication|how did you hear|how.*hear.*role|where did you hear|how did you become aware|become aware.*(?:vacancy|role|job|position|opportunity)|aware.*(?:vacancy|role|job|position|opportunity)|source|referral|referred|job board|date available|earliest available|start date|notice period)/.test(text);
+}
+
+function hasFieldCurrentValue(field, controls = getControlsByFieldId(field?.id)) {
+  if (!controls || controls.length === 0) return false;
+  if (getControlType(controls[0]) === "combobox" && !hasCurrentChoiceValue(controls)) return false;
+  const value = cleanLabel(getCurrentChoiceSummary(controls) || field?.value || "");
+  if (!value || isPlaceholderChoice(value, value)) return false;
+  if (isExperienceValueField(field, controls) && isZeroLikeExperienceValue(value)) return false;
+
+  const placeholder = cleanLabel(field?.placeholder || controls[0]?.getAttribute?.("placeholder") || "");
+  if (placeholder && normalize(value) === normalize(placeholder)) return false;
+  return true;
+}
+
+function isZeroLikeExperienceValue(value) {
+  return /^(0|0\.0+|0\s*(?:years?|yrs?)?)$/i.test(String(value || "").trim());
+}
+
+function normalizeSheetAnswers(data) {
+  const answers = Array.isArray(data?.answers) ? data.answers : [];
+  return answers
+    .map((answer) => ({
+      field_id: String(answer.field_id || answer.id || ""),
+      value: String(answer.value ?? answer.answer ?? "").trim(),
+      source: "sheet"
+    }))
+    .filter((answer) => answer.field_id && answer.value);
+}
+
+function normalizeRuntimeGptAnswers(data) {
+  const answers = Array.isArray(data?.answers) ? data.answers : [];
+  return answers
+    .map((answer) => ({
+      field_id: String(answer.field_id || answer.id || ""),
+      question: String(answer.question || ""),
+      option: String(answer.option || ""),
+      value: String(answer.value ?? answer.answer ?? "").trim(),
+      source: "runtime-gpt"
+    }))
+    .filter((answer) => answer.field_id && answer.value);
+}
+
+function normalizeDirectAiAnswers(data) {
+  const answers = Array.isArray(data?.answers) ? data.answers : [];
+  return answers
+    .map((answer) => ({
+      field_id: String(answer.field_id || answer.id || ""),
+      value: String(answer.value ?? answer.answer ?? "").trim(),
+      source: answer.source || "ai",
+      provider: answer.provider || "",
+      model: answer.model || "",
+      estimated_request_cost_usd: answer.estimated_request_cost_usd ?? null
+    }))
+    .filter((answer) => answer.field_id && answer.value);
+}
+
+function buildSheetQuestionPayload(page, context, fields, profileContext = {}) {
+  const rowValues = compactSheetRowValues(context.values || {});
+  const gptContext = getSheetGptContext(context, rowValues);
+
+  return {
+    version: 1,
+    source: "autobid-extension",
+    requested_at: new Date().toISOString(),
+    gpt_context: gptContext,
+    profile: {
+      profile_id: profileContext.profile_id || "",
+      static_fields: compactSheetRowValues(profileContext.static_fields || {})
+    },
+    page: {
+      url: page.url,
+      domain: page.domain,
+      title: page.title,
+      job_title: page.job_title,
+      text: limitSheetText(page.text, 6000)
+    },
+    row: {
+      row_number: context.rowNumber,
+      url: context.url || page.url,
+      values: rowValues
+    },
+    response_format: {
+      column: "autobid_answers",
+      json: { answers: [{ field_id: "field id from fields", question: "plain question text", option: "checkbox option when present", value: "answer to fill" }] }
+    },
+    fields: fields.map((field) => serializeSheetQuestionField(field))
+  };
+}
+
+async function getGeneratedAnswerProfileContext() {
+  try {
+    return await send("GET_PROFILE_STATIC_FIELDS");
+  } catch (error) {
+    traceAutoBid("runtime-gpt:profile-context-error", { message: error.message || String(error) });
+    return {};
+  }
+}
+
+function getSheetGptContext(context, rowValues) {
+  const tailoredResumeContent = getSheetContextValue(context, rowValues, 7, [
+    "column_g",
+    "tailored_resume_content",
+    "tailored resume content",
+    "tailor_resume_content",
+    "tailor resume content",
+    "tailored_resume",
+    "tailored resume",
+    "generated_resume_content",
+    "generated resume content",
+    "resume_content",
+    "resume content",
+    "candidate_profile",
+    "candidate profile",
+    "profile"
+  ]);
+  const jobDescription = getSheetContextValue(context, rowValues, 13, [
+    "column_m",
+    "job_description",
+    "job description",
+    "jd",
+    "job_desc",
+    "job desc",
+    "description",
+    "job_posting",
+    "job posting",
+    "job_details",
+    "job details"
+  ]);
+
+  return {
+    source_columns: {
+      tailored_resume_content: "G",
+      job_description: "M"
+    },
+    tailored_resume_content: limitSheetText(tailoredResumeContent, 12000),
+    job_description: limitSheetText(jobDescription, 12000)
+  };
+}
+
+function getSheetContextValue(context, rowValues, oneBasedColumn, aliases) {
+  const fromRawValues = findSheetValueByAlias(context.values || {}, aliases);
+  if (fromRawValues) return fromRawValues;
+
+  if (Array.isArray(context.raw)) {
+    const fromRawColumn = String(context.raw[oneBasedColumn - 1] || "").trim();
+    if (fromRawColumn) return fromRawColumn;
+  }
+
+  const fromCompactedValues = findSheetValueByAlias(rowValues, aliases);
+  if (fromCompactedValues) return fromCompactedValues;
+
+  return "";
+}
+
+function findSheetValueByAlias(values, aliases) {
+  const normalizedAliases = new Set(aliases.map(normalize));
+  for (const [key, value] of Object.entries(values || {})) {
+    const text = String(value || "").trim();
+    if (text && normalizedAliases.has(normalize(key))) return text;
+  }
+  return "";
+}
+
+function serializeSheetQuestionField(field) {
+  const controls = getControlsByFieldId(field.id);
+  const question = getPlainQuestionText(field.question || field.label);
+  const option = getPlainQuestionText(field.option || getChoiceOptionTextFromControls(field, controls));
+  return {
+    field_id: field.id,
+    question,
+    option,
+    label: question,
+    raw_label: field.label,
+    name: field.name,
+    placeholder: field.placeholder,
+    autocomplete: field.autocomplete,
+    type: field.type,
+    required: Boolean(field.required),
+    options: field.options || [],
+    current_value: hasFieldCurrentValue(field, controls) ? getCurrentChoiceSummary(controls) || field.value || "" : ""
+  };
+}
+
+function getChoiceOptionTextFromControls(field, controls) {
+  const control = controls?.[0];
+  if (!control) return "";
+  if (field.type === "checkbox") return getCheckboxOptionLabel(control, field.question || field.label);
+  return "";
+}
+
+function compactSheetRowValues(values) {
+  return Object.fromEntries(
+    Object.entries(values || {})
+      .filter(([_key, value]) => String(value || "").trim())
+      .slice(0, 80)
+      .map(([key, value]) => [key, limitSheetText(value, 3000)])
+  );
+}
+
+function limitSheetText(value, maxLength) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function shouldApplyProfileStaticValue(field, controls, rawValue, key = "") {
+  const first = controls[0];
+  if (key === "phone" && ["checkbox", "radio", "select", "combobox", "button-group"].includes(getControlType(first))) {
+    return false;
+  }
+
   const current = String(getCurrentChoiceSummary(controls) || field.value || "").trim();
   if (!current) return true;
   if (normalize(current) === normalize(rawValue)) return false;
 
-  const first = controls[0];
   if (["checkbox", "radio", "select", "combobox", "button-group"].includes(getControlType(first))) {
     return !hasCurrentChoiceValue(controls);
   }
@@ -1065,15 +3910,26 @@ function isResidenceField(field) {
 
 function matchProfileStaticFieldKey(field) {
   const text = normalize([field.autocomplete, field.name, field.label, field.placeholder].join(" "));
+  const optionText = normalize((field.options || []).join(" "));
   if (isLanguageChoiceField(field)) return "";
+  if (isAuthorizationSupportRequiredText(text)) return "";
   if (isPlainFullNameField(field)) return "full_name";
+  const addressComponentKey = matchProfileAddressComponentKey(field);
+  if (addressComponentKey) return addressComponentKey;
+  if (/(work status|right to work|employment status)/.test(text) &&
+      /(national|citizen|work permit|residence permit|third country)/.test(optionText)) {
+    return "work_authorization";
+  }
+  if (/\bcity\b/.test(text) || /(location city|city location)/.test(text)) return "city";
   const patterns = [
     ["first_name", ["given name", "first name", "firstname", "first_name"]],
     ["last_name", ["family name", "last name", "lastname", "surname", "last_name"]],
     ["full_name", ["full name", "your name", "applicant name", "candidate name"]],
+    ["email", ["email", "e mail", "mail"]],
+    ["phone", ["phone", "mobile", "telephone", "cell"]],
     ["notice_period", ["notice period", "current notice", "notice"]],
-    ["expected_rate", ["hourly rate", "rate", "expected rate", "expected salary", "salary expectation", "salary expectations", "expected compensation", "desired salary", "desired compensation", "gross monthly", "monthly salary", "salary", "compensation"]],
-    ["work_authorization", ["authorized", "authorization", "legally work", "eligible to work"]],
+    ["expected_rate", ["hourly rate", "rate", "expected rate", "expected salary", "salary expectation", "salary expectations", "expected compensation", "desired salary", "desired compensation", "desired pay", "desired annual salary", "annual salary", "day rate", "pay expectation", "pay expectations", "gross monthly", "monthly salary", "salary", "compensation"]],
+    ["work_authorization", ["authorized", "authorization", "legally work", "eligible to work", "right to work", "work status", "employment status"]],
     ["sponsorship", ["sponsor", "sponsorship", "visa"]],
     ["availability", ["availability", "available", "start date"]],
     ["linkedin", ["linkedin"]],
@@ -1081,18 +3937,70 @@ function matchProfileStaticFieldKey(field) {
     ["portfolio", ["portfolio"]],
     ["website", ["website", "personal site", "web site"]],
     ["languages", ["languages", "spoken languages", "language proficiency", "fluent languages", "languages spoken"]],
+    ["nationality", ["nationality", "citizenship", "country of citizenship", "citizen of"]],
     ["country", ["country", "residence", "current residence", "where is your current residence", "where are you based"]],
-    ["location", ["location", "address", "current city", "current location"]],
-    ["city", ["city"]],
-    ["phone", ["phone", "mobile", "telephone", "cell"]],
-    ["email", ["email", "e mail", "mail"]]
+    ["location", ["location", "address", "current location", "currently located", "where are you currently located", "where are you located"]],
+    ["city", ["city"]]
   ];
 
   for (const [key, needles] of patterns) {
-    if (needles.some((needle) => text.includes(needle))) return key;
+    if (needles.some((needle) => includesNormalizedProfilePhrase(text, needle))) return key;
   }
 
   return "";
+}
+
+function includesNormalizedProfilePhrase(text, phrase) {
+  const normalizedPhrase = normalize(phrase);
+  return Boolean(normalizedPhrase) && ` ${text} `.includes(` ${normalizedPhrase} `);
+}
+
+function matchProfileAddressComponentKey(field) {
+  const autocomplete = normalize(field.autocomplete || "");
+  const name = normalize(field.name || "");
+  const prompt = simplifyProfileAddressPrompt(field.label || field.placeholder || "");
+
+  if (autocomplete === "postal code") return "postal_code";
+  if (autocomplete === "address level1") return "state_region";
+
+  const postalAliases = new Set([
+    "postal code",
+    "postalcode",
+    "post code",
+    "postcode",
+    "zip code",
+    "zipcode",
+    "zip",
+    "pin code",
+    "postal code zip code",
+    "zip code postal code",
+    "postal zip code",
+    "zip postal code"
+  ]);
+  if (postalAliases.has(prompt) || postalAliases.has(name)) return "postal_code";
+
+  const regionAliases = new Set([
+    "state",
+    "province",
+    "region",
+    "county",
+    "prefecture",
+    "administrative area",
+    "state province",
+    "state region",
+    "province region",
+    "state province region"
+  ]);
+  if (regionAliases.has(prompt) || regionAliases.has(name)) return "state_region";
+
+  return "";
+}
+
+function simplifyProfileAddressPrompt(value) {
+  return normalize(value)
+    .replace(/^(?:what is|please enter|please select|enter|select|choose|provide)\s+(?:your\s+)?(?:current\s+)?/, "")
+    .replace(/\s+(?:required|optional)$/, "")
+    .trim();
 }
 
 function isPlainFullNameField(field) {
@@ -1109,9 +4017,13 @@ function isTextLikeStaticField(field) {
 
 function getProfileStaticValue(staticFields, key) {
   const aliases = {
-    expected_rate: ["expected_rate", "expected_salary", "salary_expectation", "salary_expectations", "monthly_salary", "monthly_salary_expectation", "desired_salary", "desired_compensation"],
+    postal_code: ["postal_code", "postalcode", "post_code", "postcode", "zip_code", "zipcode", "zip"],
+    state_region: ["state_region", "state_province_region", "state_province", "state", "province", "region", "administrative_area"],
+    expected_rate: ["expected_rate", "expected_salary", "salary_expectation", "salary_expectations", "monthly_salary", "monthly_salary_expectation", "desired_salary", "desired_compensation", "desired_pay", "pay_expectation", "pay_expectations", "annual_salary", "day_rate"],
     notice_period: ["notice_period", "current_notice_period", "availability_notice"],
-    languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"]
+    languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"],
+    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status", "nationality", "citizenship"],
+    nationality: ["nationality", "citizenship", "citizen_of", "country_of_citizenship"]
   };
 
   if (key === "full_name") {
@@ -1121,12 +4033,61 @@ function getProfileStaticValue(staticFields, key) {
     if (composed) return composed;
   }
 
+  if (key === "location") {
+    const location = String(staticFields?.location || "").trim();
+    if (location) return location;
+    return [staticFields?.city, staticFields?.country].filter(Boolean).join(", ").trim();
+  }
+
+  if (key === "city") {
+    const city = String(staticFields?.city || "").trim();
+    if (city) return city;
+    const location = String(staticFields?.location || "").trim();
+    return location.split(",").map((part) => part.trim()).filter(Boolean)[0] || "";
+  }
+
+  if (key === "country") {
+    const country = String(staticFields?.country || "").trim();
+    if (country) return country;
+    const parts = String(staticFields?.location || "").split(",").map((part) => part.trim()).filter(Boolean);
+    return parts.length > 1 ? parts[parts.length - 1] : "";
+  }
+
   for (const candidate of [key, ...(aliases[key] || [])]) {
     const value = staticFields?.[candidate];
     if (value !== undefined && value !== null && String(value).trim()) return value;
   }
 
   return staticFields?.[key];
+}
+
+function getProfileStaticCandidateValues(staticFields, key, field, controls = []) {
+  const primary = getProfileStaticValue(staticFields, key);
+  if (!["location", "city"].includes(key)) {
+    return uniqueNonEmptyValues([primary]);
+  }
+
+  const city = getProfileStaticValue(staticFields, "city");
+  const country = getProfileStaticValue(staticFields, "country");
+  const location = getProfileStaticValue(staticFields, "location");
+  const searchableLocation = field.type === "combobox" || controls.some((control) => shouldSelectTextAutocompleteOption(control, field));
+
+  if (!searchableLocation) return uniqueNonEmptyValues([primary]);
+  if (key === "city") return uniqueNonEmptyValues([city, location, primary]);
+  return uniqueNonEmptyValues([location, city, primary]);
+}
+
+function uniqueNonEmptyValues(values) {
+  const seen = new Set();
+  return values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value) => {
+      const key = normalize(value);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 function formatProfileStaticValueForField(key, value, field) {
@@ -1147,10 +4108,73 @@ function isBasedInLocationField(field) {
 }
 
 function isLanguageChoiceField(field) {
-  if (!field || !isChoiceFieldType(field.type) || !hasYesNoOptions(field.options)) return false;
+  if (!field || !isChoiceFieldType(field.type)) return false;
   const label = normalize([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
   if (!/(speak|language|fluent|fluency|proficien|native speaker|bilingual|multilingual)/.test(label)) return false;
-  return getQuestionLanguageAliases(label).length > 0;
+  if (getQuestionLanguageAliases(label).length === 0) return false;
+  return hasYesNoOptions(field.options) || isLanguageProficiencyScaleField(field);
+}
+
+function isReferralSourceField(field) {
+  if (!field || !isChoiceFieldType(field.type)) return false;
+  const label = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!/(how did you hear|how.*hear.*role|how.*hear.*job|how.*hear.*position|where did you hear|where.*hear.*role|how did you become aware|become aware.*(?:vacancy|role|job|position|opportunity)|aware.*(?:vacancy|role|job|position|opportunity)|source|referral|referred|job board|found.*role|found.*job|learn.*role|learn.*job|vacancy source)/.test(label)) {
+    return false;
+  }
+  const options = (field.options || []).map(normalize);
+  return options.length === 0 || options.some((option) => /(linkedin|indeed|job board|website|referral|google|other)/.test(option));
+}
+
+function isConsentChoiceField(field) {
+  if (!field || !isChoiceFieldType(field.type)) return false;
+  const label = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!label) return false;
+  if (/(gender|ethnicity|ethnic|race|disability|veteran|sexual orientation|date of birth|birth date|pronoun)/.test(label) &&
+    !/(consent|acknowledge|privacy|policy|process|processing|data protection)/.test(label)) {
+    return false;
+  }
+  if (isConsentChoiceLabelText(label)) return true;
+  if (hasYesNoOptions(field.options)) return false;
+  return (field.options || []).some((option, index) => scoreConsentChoiceOption(option, index) > 0);
+}
+
+function getConsentChoiceAnswer(field) {
+  if (hasYesNoOptions(field.options)) return "Yes";
+  const label = normalize([field?.question, field?.label, field?.name, field?.placeholder].filter(Boolean).join(" "));
+
+  const choices = (field.options || [])
+    .map((option) => String(option || "").trim())
+    .filter(Boolean)
+    .map((option, index) => ({ option, score: scoreConsentChoiceOption(option, index) }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  return choices[0]?.option || (isConsentChoiceLabelText(label) ? "consent" : "");
+}
+
+function isConsentChoiceLabelText(label) {
+  return /(privacy|privacy notice|privacy policy|policy|terms|data protection|process.*(?:information|data)|processing.*(?:information|data)|consent.*(?:process|processing|data|information)|provide.*consent|require.*consent|giving.*consent|grant.*consent|acknowledg.*consent|equal opportunity|monitoring|analysis|strictest confidence|voluntary.*form|form.*voluntary|please select yes no.*consent)/.test(label);
+}
+
+function scoreConsentChoiceOption(option, index) {
+  const text = normalize(option);
+  if (!text || isPlaceholderChoice(text, text)) return -100;
+  if (/\b(no|decline|do not|dont|not agree|disagree|withdraw|reject)\b/.test(text)) return -200;
+
+  let score = 0;
+  if (/\b(yes|agree|accept|accepted|acknowledge|confirm)\b/.test(text)) score += 300;
+  if (/(grant|give|provide).{0,30}consent|consent.{0,30}(processing|process|recruitment|data|personal data)/.test(text)) score += 420;
+  if (/(privacy|policy|notice|terms|data protection|processing.*data|personal data)/.test(text)) score += 220;
+  if (score > 0) score += Math.max(0, 20 - index);
+  return score;
+}
+
+function isConsentChoiceAlreadyAccepted(current) {
+  const text = normalize(current);
+  if (!text) return false;
+  if (text === "yes") return true;
+  if (/\b(no|decline|do not|dont|not agree|disagree|withdraw|reject)\b/.test(text)) return false;
+  return /(agree|accept|accepted|acknowledge|confirm|consent|privacy|policy|data protection|processing.*data|personal data)/.test(text);
 }
 
 function isChoiceFieldType(type) {
@@ -1202,8 +4226,53 @@ function getQuestionLanguageAliases(label) {
   return getLanguageAliasesFromText(label);
 }
 
-function getLanguageChoiceAnswer(questionLanguages) {
-  return (questionLanguages || []).some((language) => normalize(language) === "english") ? "Yes" : "No";
+function getLanguageChoiceAnswer(field, questionLanguages) {
+  const isEnglish = (questionLanguages || []).some((language) => normalize(language) === "english");
+  if (isLanguageProficiencyScaleField(field)) {
+    return isEnglish ? "C1 Advanced" : getLowestLanguageProficiencyOption(field);
+  }
+  return isEnglish ? "Yes" : "No";
+}
+
+function isLanguageProficiencyScaleField(field) {
+  if (!field || !isChoiceFieldType(field.type)) return false;
+  const options = (field.options || []).map(normalize).filter(Boolean);
+  if (options.length === 0 || hasYesNoOptions(field.options)) return false;
+  return options.some((option) => /\b(a1|a2|b1|b2|c1|c2)\b|elementary|beginner|intermediate|advanced|proficient|fluent|native/.test(option));
+}
+
+function isLanguageChoiceAlreadyAcceptable(field, current, answer) {
+  const normalizedCurrent = normalize(current);
+  const normalizedAnswer = normalize(answer);
+  if (!normalizedCurrent) return false;
+  if (normalizeComparableValue(normalizedCurrent) === normalizeComparableValue(normalizedAnswer)) return true;
+
+  if (isLanguageProficiencyScaleField(field) && /english/.test(normalize(field.label))) {
+    return /\b(c1|c2)\b|advanced|proficient|fluent|native/.test(normalizedCurrent);
+  }
+
+  return false;
+}
+
+function getLowestLanguageProficiencyOption(field) {
+  const options = field.options || [];
+  const scored = options
+    .map((option) => ({ option, score: scoreLanguageProficiencyLevel(option) }))
+    .filter((item) => Number.isFinite(item.score))
+    .sort((a, b) => a.score - b.score);
+  return scored[0]?.option || "";
+}
+
+function scoreLanguageProficiencyLevel(option) {
+  const text = normalize(option);
+  if (/\b(no|none|not applicable|n a)\b/.test(text)) return 0;
+  if (/\ba1\b|beginner|basic/.test(text)) return 1;
+  if (/\ba2\b|elementary/.test(text)) return 2;
+  if (/\bb2\b|upper intermediate/.test(text)) return 4;
+  if (/\bb1\b|intermediate/.test(text)) return 3;
+  if (/\bc1\b|advanced/.test(text)) return 5;
+  if (/\bc2\b|proficient|fluent|native/.test(text)) return 6;
+  return NaN;
 }
 
 function getLanguageAliasesFromText(text) {
@@ -1224,10 +4293,11 @@ function hasPhrase(normalizedText, phrase) {
   return needle.trim() ? text.includes(needle) : false;
 }
 
-async function applyHoveredDropdownSelection(fields) {
+async function applyHoveredDropdownSelection(fields, skipFilledIds = new Set()) {
   const filledIds = new Set();
   const fieldId = getHoveredAutoBidFieldId();
   if (!fieldId) return { filled: 0, missed: 0, filledIds };
+  if (skipFilledIds.has(fieldId)) return { filled: 0, missed: 0, filledIds };
 
   const field = fields.find((item) => item.id === fieldId);
   if (!field || !CHOICE_FIELD_TYPES.includes(field.type) || !shouldUsePositiveDropdownFallback(field)) {
@@ -1236,6 +4306,7 @@ async function applyHoveredDropdownSelection(fields) {
 
   const controls = getControlsByFieldId(field.id);
   if (controls.length === 0) return { filled: 0, missed: 0, filledIds };
+  if (hasFieldCurrentValue(field, controls)) return { filled: 0, missed: 0, filledIds };
 
   showStatus(`Selecting hovered dropdown: ${shortText(field.label)}`, "success");
   const positiveChoice = await findMostPositiveChoice(controls, field);
@@ -1400,13 +4471,12 @@ async function applyDeterministicDefaults(fields, filledIds) {
   const localFilledIds = new Set();
 
   for (const field of fields) {
-    if (filledIds.has(field.id)) continue;
-
     const controls = getControlsByFieldId(field.id);
     if (controls.length === 0) continue;
 
     const fallback = getDeterministicDefault(field, controls);
     if (!fallback) continue;
+    if (filledIds.has(field.id) && !shouldForceDeterministicDefault(field, controls, fallback)) continue;
 
     const current = getCurrentChoiceSummary(controls);
     const alreadyApplied = getControlType(controls[0]) === "range"
@@ -1417,12 +4487,18 @@ async function applyDeterministicDefaults(fields, filledIds) {
       continue;
     }
 
-    const selected = await setDeterministicDefaultValue(controls, fallback.value);
+    const candidateValues = uniqueValues([fallback.value, ...(fallback.values || [])]);
+    let selected = false;
+    for (const value of candidateValues) {
+      selected = await setDeterministicDefaultValue(controls, value, fallback);
+      if (selected) break;
+    }
     traceAutoBid("default:applied", {
       field_id: field.id,
       label: field.label,
       reason: fallback.reason,
       value: fallback.value,
+      candidates: candidateValues,
       selected,
       current: getCurrentChoiceSummary(controls)
     });
@@ -1443,12 +4519,17 @@ function getDeterministicDefault(field, controls) {
     return { value: "PostgreSQL", reason: "database-default" };
   }
 
+  if (isAuthorizationSupportRequiredChoiceField(field, controls)) {
+    return { value: "No", reason: "authorization-support-not-required" };
+  }
+
   if (isAvailabilityDateField(field, controls)) {
     return { value: formatDateForControl(getNextMondayDate(), controls[0], field), reason: "next-monday" };
   }
 
-  if (isExperienceValueField(field, controls)) {
-    return { value: getDefaultExperienceYears(controls[0]), reason: "experience-years" };
+  const experienceDefault = getExperienceYearsDefault(field, controls);
+  if (experienceDefault) {
+    return experienceDefault;
   }
 
   return null;
@@ -1462,6 +4543,25 @@ function isDatabaseChoiceField(field, controls) {
     options.some((option) => /(postgresql|postgres|postgre sql)/.test(option));
 }
 
+function isAuthorizationSupportRequiredChoiceField(field, controls) {
+  if (!isChoiceFieldType(field.type)) return false;
+  if (!hasYesNoOptions(field.options)) return false;
+  const label = getFieldContextLabel(field, controls?.[0]);
+  return isAuthorizationSupportRequiredText(label);
+}
+
+function isAuthorizationSupportRequiredText(value) {
+  const text = normalize(value);
+  if (!text) return false;
+  if (/(authorized|authorised|eligible|legally).*(work|employ)|(work|employ).*(authorized|authorised|eligible|legally)/.test(text)) return false;
+  if (/without.{0,80}(sponsor|sponsorship|visa|work permit|support)/.test(text)) return false;
+  const supportNoun = /(authorization|authorisation|sponsor|sponsorship|visa|work permit|work authorization support|work authorisation support)/;
+  const requireVerb = /(require|need|needs|needed|seek|seeking|request|support|depend|dependent)/;
+  return (requireVerb.test(text) && supportNoun.test(text)) ||
+    /(now|future).{0,80}(authorization|authorisation|sponsor|sponsorship|visa|work permit)/.test(text) ||
+    /(authorization|authorisation|sponsor|sponsorship|visa|work permit).{0,80}(now|future|support|required|needed)/.test(text);
+}
+
 function isAvailabilityDateField(field, controls) {
   const control = controls?.[0];
   const type = getControlType(control);
@@ -1470,12 +4570,132 @@ function isAvailabilityDateField(field, controls) {
   return /(date available|available date|available start date|earliest.*start|start date|when.*start|availability date)/.test(label);
 }
 
+function getExperienceYearsDefault(field, controls) {
+  const control = controls?.[0];
+  const type = getControlType(control);
+  const label = getFieldContextLabel(field, control);
+  if (!isExperienceYearsLabel(label)) return null;
+
+  const kind = getExperienceYearsKind(label);
+  const targetYears = getExperienceDefaultTargetYears(kind);
+  const reason = `experience-years-${kind}`;
+
+  if (isChoiceFieldType(type)) {
+    const bestOption = findBestExperienceYearsOption(field.options || [], targetYears);
+    const values = buildExperienceChoiceValueCandidates(targetYears, bestOption);
+    return {
+      value: values[0],
+      values,
+      reason,
+      target_years: targetYears
+    };
+  }
+
+  if (["range", "number", "text"].includes(type)) {
+    const textEntryTargetYears = getTextEntryExperienceDefaultTargetYears(label, kind);
+    return { value: getDefaultExperienceYears(control, textEntryTargetYears), reason, target_years: textEntryTargetYears };
+  }
+
+  return null;
+}
+
 function isExperienceValueField(field, controls) {
   const control = controls?.[0];
   const type = getControlType(control);
   if (!["range", "number", "text"].includes(type)) return false;
   const label = getFieldContextLabel(field, control);
+  return isExperienceYearsLabel(label);
+}
+
+function isExperienceYearsLabel(label) {
   return /(how many.*years.*experience|years.*professional.*experience|years.*experience|experience.*years)/.test(label);
+}
+
+function getExperienceYearsKind(label) {
+  const text = normalize(label);
+  if (isDomainExperienceText(text)) return "domain";
+  if (isTechSkillExperienceText(text)) return "tech";
+  return "general";
+}
+
+function getExperienceDefaultTargetYears(kind) {
+  if (kind === "domain") return 7;
+  if (kind === "tech") return 9;
+  return 10;
+}
+
+function getTextEntryExperienceDefaultTargetYears(_label, _kind) {
+  return 7;
+}
+
+function isDomainExperienceText(text) {
+  return /(backend development|frontend development|front end development|full stack development|software development|web development|mobile development|domain|industry|sector|e commerce|ecommerce|commerce|d2c|direct to consumer|b2b|b2c|fintech|financial tech|banking|finance|payments|igaming|gaming|retail|marketplace|healthcare|health care|medtech|edtech|insurtech|proptech|martech|adtech|travel|hospitality|logistics|media|saas)/.test(text);
+}
+
+function isTechSkillExperienceText(text) {
+  return /(python|react|node|node js|nestjs|nest js|next js|javascript|typescript|java\b|kotlin|spring|c sharp|c#|\.net|dotnet|php|ruby|rails|go\b|golang|rust|scala|aws|azure|gcp|cloud|api|graphql|rest|sql|postgres|postgresql|mysql|mongodb|redis|docker|kubernetes|k8s|terraform|angular|vue|svelte|frontend|front end|mobile|android|ios|react native)/.test(text);
+}
+
+function findBestExperienceYearsOption(options, targetYears) {
+  const scored = (options || [])
+    .map((option) => ({ option: String(option || "").trim(), score: scoreExperienceYearsOption(option, targetYears) }))
+    .filter((item) => item.option && item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  return scored[0]?.option || "";
+}
+
+function buildExperienceChoiceValueCandidates(targetYears, bestOption = "") {
+  const target = String(targetYears);
+  const candidates = [bestOption, target, `${target} years`];
+
+  if (targetYears === 7) {
+    candidates.push("7-9", "6-7", "5-7", "7+", "4-6");
+  } else if (targetYears === 9) {
+    candidates.push("7-9", "8-9", "8+", "9+", "6-9");
+  } else {
+    candidates.push("10+", "10 years", "10 or more", "8-10", "7-10");
+  }
+
+  return uniqueValues(candidates);
+}
+
+function scoreExperienceYearsOption(option, targetYears) {
+  const range = parseExperienceYearsOption(option);
+  if (!range) return 0;
+
+  const span = Number.isFinite(range.max) ? Math.max(0, range.max - range.min) : 8;
+  let score = 0;
+
+  if (range.min <= targetYears && targetYears <= range.max) {
+    score = 1000 - span * 8;
+  } else if (Number.isFinite(range.max) && range.max <= targetYears) {
+    score = 820 + range.max * 12 - (targetYears - range.max) * 24;
+  } else if (range.min > targetYears) {
+    score = 420 - (range.min - targetYears) * 45;
+  }
+
+  if (targetYears < 10 && range.min >= 10) score -= 260;
+  return score;
+}
+
+function parseExperienceYearsOption(option) {
+  const text = normalize(option);
+  if (!text || isPlaceholderChoice(text, text)) return null;
+  const numbers = text.match(/\d+(?:\.\d+)?/g)?.map(Number).filter(Number.isFinite) || [];
+  if (numbers.length === 0) return null;
+
+  if (/less than|under|below|fewer than|up to|at most/.test(text)) {
+    return { min: 0, max: numbers[0] };
+  }
+
+  const hasPlus = /\+|plus|or more|more than|over|above|greater than|at least/.test(String(option || "").toLowerCase()) ||
+    /or more|more than|over|above|greater than|at least/.test(text);
+  if (numbers.length >= 2) {
+    return { min: Math.min(numbers[0], numbers[1]), max: Math.max(numbers[0], numbers[1]) };
+  }
+
+  if (hasPlus) return { min: numbers[0], max: Infinity };
+  return { min: numbers[0], max: numbers[0] };
 }
 
 function getFieldContextLabel(field, control) {
@@ -1489,7 +4709,7 @@ function getFieldContextLabel(field, control) {
   ].filter(Boolean).join(" "));
 }
 
-async function setDeterministicDefaultValue(controls, value) {
+async function setDeterministicDefaultValue(controls, value, fallback = null) {
   const first = controls[0];
   const type = getControlType(first);
 
@@ -1497,7 +4717,11 @@ async function setDeterministicDefaultValue(controls, value) {
     return setRangeValueWithVisibleEditor(first, value);
   }
 
-  if (["number", "date"].includes(type)) {
+  if (type === "number" || (type === "text" && String(fallback?.reason || "").startsWith("experience-years-"))) {
+    return setNumberInputDefaultValue(first, value, controls);
+  }
+
+  if (type === "date") {
     await scrollElementIntoView(first, "center");
     setNativeValue(first, value);
     dispatchInput(first);
@@ -1506,6 +4730,43 @@ async function setDeterministicDefaultValue(controls, value) {
   }
 
   return setControlsValue(controls, value);
+}
+
+function shouldForceDeterministicDefault(field, controls, fallback) {
+  if (!fallback || !isExperienceValueField(field, controls)) return false;
+  const current = getCurrentChoiceSummary(controls) || field?.value || "";
+  return isZeroLikeExperienceValue(current);
+}
+
+async function setNumberInputDefaultValue(input, value, controls) {
+  await scrollElementIntoView(input, "center");
+
+  if (!await nativeClickElement(input)) {
+    dispatchRealisticMouseClick(input);
+  }
+  input.focus?.();
+  await sleep(140);
+
+  clearTextEntryValue(input);
+  await sleep(80);
+
+  if (await nativeTypeText(value, false)) {
+    dispatchInput(input);
+    input.blur?.();
+    await sleep(500);
+    if (normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value)) return true;
+  }
+
+  if (replaceTextEntryValue(input, value)) {
+    await sleep(500);
+    if (normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value)) return true;
+  }
+
+  setNativeValue(input, value);
+  dispatchInput(input);
+  input.blur?.();
+  await sleep(500);
+  return normalizeComparableValue(getCurrentChoiceSummary(controls)) === normalizeComparableValue(value);
 }
 
 async function setRangeValueWithVisibleEditor(control, value) {
@@ -1560,7 +4821,7 @@ function replaceTextEntryValue(element, value) {
   const tag = element.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA") {
     element.focus?.();
-    element.select?.();
+    safelySelectTextEntry(element);
     setNativeValue(element, value);
     dispatchInput(element);
     element.blur?.();
@@ -1583,9 +4844,35 @@ function replaceTextEntryValue(element, value) {
   return false;
 }
 
-async function nativeTypeText(value) {
+function clearTextEntryValue(element) {
+  if (!element) return false;
+  element.focus?.();
+  safelySelectTextEntry(element);
+  setNativeValue(element, "");
+  dispatchInput(element);
+  return String(element.value || "") === "";
+}
+
+function safelySelectTextEntry(element) {
   try {
-    const result = await send("NATIVE_TYPE", { text: String(value), commit: true });
+    element.select?.();
+    return true;
+  } catch (_error) {
+    // Number inputs reject select() in Chromium; native Ctrl+A still selects them.
+  }
+
+  try {
+    const length = String(element.value || "").length;
+    element.setSelectionRange?.(0, length);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function nativeTypeText(value, commit = true) {
+  try {
+    const result = await send("NATIVE_TYPE", { text: String(value), commit });
     return result?.typed === true;
   } catch (error) {
     traceAutoBid("native-type:failed", { message: error.message || String(error) });
@@ -1679,11 +4966,11 @@ function getRangeCandidateValue(element) {
   return cleanLabel(ownText || (element.children.length === 0 ? element.textContent : ""));
 }
 
-function getDefaultExperienceYears(control) {
+function getDefaultExperienceYears(control, preferredYears = 10) {
   const min = parseFiniteNumber(control?.min, 0);
   const max = parseFiniteNumber(control?.getAttribute?.("max") || control?.max, NaN);
   const step = parseFiniteNumber(control?.step, 1);
-  let value = Number.isFinite(max) && max > min ? max : 10;
+  let value = preferredYears;
 
   if (value < min) value = min;
   if (Number.isFinite(max) && value > max) value = max;
@@ -1695,12 +4982,17 @@ function getDefaultExperienceYears(control) {
 }
 
 function parseFiniteNumber(value, fallback) {
+  if (value == null || String(value).trim() === "") return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
 }
 
 function formatNumberValue(value) {
   return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+}
+
+function uniqueValues(values) {
+  return Array.from(new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean)));
 }
 
 function getNextMondayDate(now = new Date()) {
@@ -1745,7 +5037,7 @@ function hasCurrentChoiceValue(controls) {
   const first = controls[0];
   const type = getControlType(first);
 
-  if (type === "radio") return controls.some((control) => control.checked);
+  if (type === "radio") return controls.some(isRadioChecked);
   if (type === "checkbox") return isCheckboxChecked(first);
   if (type === "button-group") return Boolean(getSelectedChoiceButtonLabel(controls));
   if (first.tagName === "SELECT") {
@@ -1754,7 +5046,24 @@ function hasCurrentChoiceValue(controls) {
     return Boolean(first.value && !isPlaceholderChoice(option.textContent, option.value));
   }
   if (type === "combobox") {
-    const value = cleanLabel(first.value || getComboboxSelectedText(first) || first.textContent || "");
+    const selectedText = getComboboxSelectedText(first);
+    if (selectedText && !isPlaceholderChoice(selectedText, selectedText)) return true;
+
+    const shell = getComboboxShell(first);
+    const hiddenValue = Array.from(shell?.querySelectorAll?.("input[type='hidden']") || [])
+      .map((input) => cleanLabel(input.value || ""))
+      .find((value) => value && !isPlaceholderChoice(value, value));
+    if (hiddenValue) return true;
+
+    const input = getComboboxInput(first);
+    const isSearchableChoice = Boolean(
+      input.getAttribute?.("aria-autocomplete") ||
+      input.getAttribute?.("aria-controls") ||
+      getReactSelectInstanceId(first)
+    );
+    if (isSearchableChoice) return false;
+
+    const value = cleanLabel(input.value || first.value || first.textContent || "");
     return Boolean(value && !isPlaceholderChoice(value, value));
   }
 
@@ -1767,7 +5076,7 @@ function getCurrentChoiceSummary(controls) {
   const type = getControlType(first);
 
   if (type === "radio") {
-    const checked = controls.find((control) => control.checked);
+    const checked = controls.find(isRadioChecked);
     return checked ? getRadioOptionLabel(checked) || checked.value || "" : "";
   }
 
@@ -1785,7 +5094,7 @@ function getCurrentChoiceSummary(controls) {
   }
 
   if (type === "combobox") {
-    return cleanLabel(first.value || getComboboxSelectedText(first) || first.textContent || "");
+    return cleanLabel(getComboboxSelectedText(first) || first.value || first.textContent || "");
   }
 
   return cleanLabel(first.value || "");
@@ -1794,13 +5103,16 @@ function getCurrentChoiceSummary(controls) {
 function shouldUsePositiveDropdownFallback(field) {
   if (isBasedInLocationField(field)) return false;
   if (isLanguageChoiceField(field)) return false;
+  if (isAuthorizationSupportRequiredText(field.label)) return true;
   const label = normalize(field.label);
-  return /(experience|years|level|proficiency|skill|expertise|knowledge|familiar|comfortable|rating|seniority|sponsor|sponsorship|visa|authorized|eligible|willing|available|open to|agree|accept|consent|confirm|legally|relocat|remote|can you|able to|do you have|have you|do you use|have you used|use.*ai|ai.*assist|artificial intelligence|development workflow|meet.*requirement|salary|compensation)/.test(label);
+  if (/have you (?:ever )?used .+ before|used .+ previously/.test(label)) return false;
+  return /(experience|years|level|proficiency|skill|expertise|knowledge|familiar|comfortable|rating|seniority|sponsor|sponsorship|visa|authorization|authorisation|authorized|eligible|willing|available|open to|agree|accept|consent|confirm|legally|relocat|remote|can you|able to|do you have|have you|do you use|have you used|use.*ai|ai.*assist|artificial intelligence|development workflow|meet.*requirement|salary|compensation)/.test(label);
 }
 
 function shouldUsePositiveCheckboxFallback(field) {
   const label = normalize([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
   if (!label) return false;
+  if (isFileUploadChoiceText(label)) return false;
   if (isSensitiveOrPersonalChoiceCheckbox(label)) return false;
   if (/(terms|privacy|policy|consent|agree|accept|acknowledge|confirm|certify|accurate|contact me|future job opportunit|future opportunit|talent community|job alert|keep my data|retain my data|store my data|process my data|data processing|email me|reach out|recruiting communication|recruitment communication|consider me for future)/.test(label)) return true;
   return false;
@@ -1810,7 +5122,7 @@ function isSensitiveOrPersonalChoiceCheckbox(label) {
   return /(pronoun|he him|she her|they them|xe xem|ze hir|ey em|hir hir|fae faer|hu hu|use name only|custom|gender|race|ethnicity|ethnic|disability|veteran|protected veteran|sexual orientation|date of birth|birth date|newsletter|marketing email|product update|event update)/.test(label);
 }
 
-async function setControlsValue(controls, value) {
+async function setControlsValue(controls, value, field = null, context = {}) {
   const first = controls[0];
   const type = getControlType(first);
   const textValue = String(value || "").trim();
@@ -1826,6 +5138,26 @@ async function setControlsValue(controls, value) {
 
   if (type === "button-group") {
     return setButtonGroupValue(controls, textValue);
+  }
+
+  if (type === "contenteditable") {
+    first.focus?.();
+    first.textContent = textValue;
+    first.dispatchEvent(new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: "insertText",
+      data: textValue
+    }));
+    first.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      composed: true,
+      inputType: "insertText",
+      data: textValue
+    }));
+    first.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    return normalize(first.textContent || "") === normalize(textValue);
   }
 
   if (first.tagName === "SELECT") {
@@ -1848,14 +5180,158 @@ async function setControlsValue(controls, value) {
   }
 
   if (type === "combobox") {
-    return setComboboxValue(first, textValue);
+    return setComboboxValue(first, textValue, field, context);
   }
 
-  const setter = Object.getOwnPropertyDescriptor(first.constructor.prototype, "value")?.set;
-  if (setter) setter.call(first, textValue);
-  else first.value = textValue;
+  const requiresAutocompleteSelection = shouldSelectTextAutocompleteOption(first, field);
+  const country = String(context.country || "").trim();
+  if (requiresAutocompleteSelection &&
+      context.locationCountryFirst &&
+      country &&
+      normalize(country) !== normalize(textValue)) {
+    first.focus?.();
+    setNativeValue(first, country);
+    dispatchInput(first);
+    traceAutoBid("location-autocomplete:country-prime", {
+      field_id: field?.id || first.dataset?.autoBidFieldId || "",
+      label: field?.question || field?.label || "",
+      country
+    });
+    await sleep(LOCATION_AUTOCOMPLETE_WAIT_MS);
+  }
+  first.focus?.();
+  setNativeValue(first, textValue);
   dispatchInput(first);
+  if (requiresAutocompleteSelection && !await maybeSelectTextAutocompleteOption(first, textValue, field, context)) {
+    await clearControlsForRetry(controls);
+    return false;
+  }
+  if (requiresAutocompleteSelection) return true;
+
+  if (await waitForTextControlValue(first, textValue, 900)) return true;
+  first.focus?.();
+  setNativeValue(first, textValue);
+  first.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: textValue }));
+  first.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  const retained = await waitForTextControlValue(first, textValue, 1200);
+  if (!retained) {
+    traceAutoBid("text-value:not-retained", {
+      field_id: field?.id || first.dataset?.autoBidFieldId || "",
+      label: field?.question || field?.label || "",
+      expected: shortText(textValue),
+      current: shortText(first.value || ""),
+      connected: first.isConnected
+    });
+  }
+  return retained;
+}
+
+async function waitForTextControlValue(control, expectedValue, timeoutMs) {
+  const expected = normalize(expectedValue);
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (normalize(getControlValue(control)) === expected && expected) return true;
+    await sleep(80);
+  }
+  return normalize(getControlValue(control)) === expected && Boolean(expected);
+}
+
+async function clearControlsForRetry(controls) {
+  const first = controls?.[0];
+  if (!first) return;
+  const type = getControlType(first);
+  if (type === "combobox") await closeCombobox(first);
+
+  const target = type === "combobox" ? getComboboxInput(first) : first;
+  if (target?.matches?.("input, textarea") && !target.readOnly && !target.disabled) {
+    target.focus?.();
+    setNativeValue(target, "");
+    dispatchInput(target);
+    target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+    target.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+    target.blur?.();
+  }
+  await sleep(180);
+}
+
+async function maybeSelectTextAutocompleteOption(control, value, field, context = {}) {
+  if (!shouldSelectTextAutocompleteOption(control, field)) return false;
+  const waitMs = context.locationCountryFirst &&
+    normalize(context.country || "") === normalize(value)
+    ? LOCATION_AUTOCOMPLETE_WAIT_MS
+    : 350;
+  await sleep(waitMs);
+
+  const options = getTextAutocompleteOptions(control);
+  if (options.length === 0) {
+    pressAutocompleteKey(control, "ArrowDown");
+    await sleep(300);
+  }
+
+  const choices = getTextAutocompleteOptions(control)
+    .map((option, index) => ({
+      control: option,
+      text: option.textContent || option.getAttribute("aria-label") || option.getAttribute("data-value") || "",
+      value: option.getAttribute("data-value") || option.getAttribute("value") || option.textContent || "",
+      index
+    }));
+  const match = findBestAutocompleteChoice(choices, value, field, context);
+  if (!match?.control) {
+    return false;
+  }
+
+  await clickChoice(match.control);
+  await sleep(300);
   return true;
+}
+
+function shouldSelectTextAutocompleteOption(control, field) {
+  if (!control?.matches?.("input, textarea")) return false;
+  const text = normalize([
+    field?.question,
+    field?.label,
+    field?.name,
+    field?.placeholder,
+    control.getAttribute("aria-label"),
+    control.getAttribute("placeholder"),
+    control.getAttribute("autocomplete"),
+    control.name,
+    control.id
+  ].filter(Boolean).join(" "));
+  if (!/(city|country|location|located|residence|address|state|province|region)/.test(text)) return false;
+  return Boolean(
+    control.getAttribute("aria-autocomplete") ||
+    control.getAttribute("aria-controls") ||
+    control.getAttribute("aria-owns") ||
+    control.getAttribute("role") === "combobox" ||
+    /combobox|autocomplete|autosuggest|typeahead|places/.test(control.className || "")
+  );
+}
+
+function getTextAutocompleteOptions(control) {
+  const roots = getComboboxRoots(control);
+  const selector = [
+    "[role='option']",
+    "[role='menuitem']",
+    "[data-value]",
+    "[cmdk-item]",
+    "[class*='option' i]",
+    "[class*='suggestion' i]",
+    "[class*='autocomplete' i] li",
+    "[class*='typeahead' i] li",
+    "li"
+  ].join(",");
+  return collectChoiceElements(roots, selector, control)
+    .filter((option) => !isPlaceholderChoice(option.textContent || "", option.getAttribute("data-value") || option.getAttribute("value") || ""));
+}
+
+function pressAutocompleteKey(control, key) {
+  const normalizedKey = key === " " ? " " : key;
+  const code = key === " " ? "Space" : key;
+  const keyCode = key === "ArrowDown" ? 40 : key === "Escape" ? 27 : 13;
+  control.focus?.();
+  control.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: normalizedKey, code, keyCode, which: keyCode }));
+  control.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: normalizedKey, code, keyCode, which: keyCode }));
 }
 
 async function setRadioValue(controls, value) {
@@ -1875,14 +5351,15 @@ async function setRadioValue(controls, value) {
   if (!await nativeClickElement(target)) {
     dispatchRealisticMouseClick(target);
   }
-  await sleep(120);
+  await sleep(180);
 
-  if (!radio.checked) {
+  if (!isRadioChecked(radio) && radio.matches?.("input[type='radio']")) {
     setNativeChecked(radio, true);
     dispatchInput(radio);
+    await sleep(120);
   }
 
-  return radio.checked;
+  return isRadioChecked(radio);
 }
 
 function getRadioClickTarget(radio) {
@@ -1930,13 +5407,17 @@ function getCheckboxClickTargets(control) {
   const root = input || control;
   const rootNode = root.getRootNode?.() || document;
   const forLabel = root.id ? queryOne(`label[for="${cssEscape(root.id)}"]`, rootNode) : null;
+  const consentRow = isConsentCheckboxText(getConsentCheckboxLabel(root, root)) ? getConsentCheckboxRow(root) : null;
 
   [
     forLabel,
     root.closest?.("label"),
+    consentRow,
     root.closest?.("[class*='checkbox' i]"),
+    root.closest?.("[class*='consent' i], [class*='privacy' i], [class*='terms' i]"),
     root.closest?.("[class*='option' i]"),
     root.closest?.("li"),
+    root.parentElement?.parentElement,
     root.parentElement,
     control
   ].forEach((target) => {
@@ -2074,38 +5555,74 @@ async function findMostPositiveChoice(controls, field) {
   return scored.find((choice) => choice.score > 0) || null;
 }
 
-async function setComboboxValue(control, value) {
-  const options = await getComboboxChoices(control, value);
-  const match = findBestChoice(
-    options.map((option, index) => ({
+async function setComboboxValue(control, value, field = null, context = {}) {
+  const country = String(context.country || "").trim();
+  if (context.locationCountryFirst &&
+      country &&
+      normalize(country) !== normalize(value)) {
+    await clearComboboxSearchValue(control);
+    await getComboboxChoices(control, country, {
+      filterWaitMs: LOCATION_AUTOCOMPLETE_WAIT_MS
+    });
+    traceAutoBid("location-autocomplete:country-prime", {
+      field_id: field?.id || control.dataset?.autoBidFieldId || "",
+      label: field?.question || field?.label || "",
+      country
+    });
+  }
+
+  const options = await getComboboxChoices(control, value, {
+    filterWaitMs: context.locationCountryFirst &&
+      normalize(country) === normalize(value)
+      ? LOCATION_AUTOCOMPLETE_WAIT_MS
+      : 220
+  });
+  const choices = options.map((option, index) => ({
       control: option,
       text: option.textContent,
       value: option.getAttribute("data-value") || option.getAttribute("value") || option.textContent,
       index
-    })),
-    value
-  );
+    }));
+  const match = findBestAutocompleteChoice(choices, value, field, context);
 
-  if (!match) return false;
+  if (!match) {
+    await clearComboboxSearchValue(control);
+    await closeCombobox(control);
+    return false;
+  }
 
-  return selectComboboxChoice(control, match);
+  const selected = await selectComboboxChoice(control, match);
+  if (!selected) await closeCombobox(control);
+  return selected;
 }
 
-async function getComboboxChoices(control, filterValue) {
-  const options = await openCombobox(control, filterValue);
-  return options.filter((option) => !isPlaceholderChoice(option.textContent, option.getAttribute("data-value") || option.getAttribute("value") || ""));
+async function getComboboxChoices(control, filterValue, options = {}) {
+  const choices = await openCombobox(control, filterValue, options);
+  return choices.filter((option) => !isPlaceholderChoice(option.textContent, option.getAttribute("data-value") || option.getAttribute("value") || ""));
 }
 
-async function openCombobox(control, filterValue) {
+async function openCombobox(control, filterValue, config = {}) {
   await scrollElementIntoView(control, "center");
   const input = getComboboxInput(control);
+  const canFilter = Boolean(
+    filterValue &&
+    input?.matches?.("input, textarea") &&
+    !input.readOnly &&
+    !input.disabled
+  );
   if (document.activeElement === input && !isComboboxOpen(control)) {
     input.blur();
     await sleep(80);
   }
 
   let options = getVisibleChoiceElements(control);
-  if (isComboboxOpen(control) && options.length > 0) return options;
+  if (isComboboxOpen(control) && options.length > 0) {
+    if (canFilter) {
+      await applyComboboxFilter(input, filterValue, config.filterWaitMs);
+      options = await waitForComboboxFilteredOptions(control, filterValue, DROPDOWN_OPEN_TIMEOUT_MS);
+    }
+    return options;
+  }
 
   const trigger = getComboboxTrigger(control);
   const nativeClicked = await nativeClickElement(trigger);
@@ -2113,25 +5630,79 @@ async function openCombobox(control, filterValue) {
   if (!nativeClicked) {
     runPageCommand("combobox-open", input || trigger);
   }
-  options = await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
+  if (canFilter) await applyComboboxFilter(input, filterValue, config.filterWaitMs);
+  options = canFilter
+    ? await waitForComboboxFilteredOptions(control, filterValue, DROPDOWN_OPEN_TIMEOUT_MS)
+    : await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
   traceAutoBid("dropdown:open-after-click", describeComboboxState(control, { optionCount: options.length }));
   if (options.length > 0) return options;
 
   pressComboboxKey(input || control, "ArrowDown");
-  options = await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
+  options = canFilter
+    ? await waitForComboboxFilteredOptions(control, filterValue, DROPDOWN_OPEN_TIMEOUT_MS)
+    : await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
   traceAutoBid("dropdown:open-after-key", describeComboboxState(control, { optionCount: options.length }));
   if (options.length === 0) {
-    if (lastNativeClickError) throw consumeNativeClickError();
+    reportAndClearNativeClickError(control);
     return [];
   }
 
-  if ("value" in input && filterValue && !input.readOnly) {
-    setNativeValue(input, filterValue);
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: filterValue }));
+  if (!canFilter && "value" in input && filterValue && !input.readOnly) {
+    await applyComboboxFilter(input, filterValue, config.filterWaitMs);
     options = await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
   }
 
   return options;
+}
+
+async function applyComboboxFilter(input, filterValue, waitMs = 220) {
+  if (!input?.matches?.("input, textarea") || input.readOnly || input.disabled) return false;
+  input.focus?.();
+  setNativeValue(input, filterValue);
+  input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: filterValue }));
+  await sleep(Math.max(0, Number(waitMs) || 220));
+  return true;
+}
+
+async function clearComboboxSearchValue(control) {
+  const input = getComboboxInput(control);
+  if (!input?.matches?.("input, textarea") || input.readOnly || input.disabled || !input.value) return;
+  input.focus?.();
+  setNativeValue(input, "");
+  dispatchInput(input);
+  await sleep(80);
+}
+
+function findBestAutocompleteChoice(choices, value, field, context = {}) {
+  if (!context.locationCountryFirst) return findBestChoice(choices, value);
+
+  const answer = normalize(value);
+  const country = normalize(context.country || "");
+  let candidates = choices;
+
+  if (context.profileKey === "country" && country && answer === country) {
+    const exactCountryChoices = choices.filter((choice) => {
+      const rawText = cleanLabel(choice.text || choice.value || "");
+      const text = normalize(rawText);
+      return text === country || text.startsWith(`${country} `) && !rawText.includes(",");
+    });
+    if (exactCountryChoices.length === 0) return null;
+    candidates = exactCountryChoices;
+  } else if (country) {
+    const answerAndCountryChoices = choices.filter((choice) => {
+      const text = normalize(choice.text || choice.value || "");
+      return text.includes(answer) && text.includes(country);
+    });
+    if (answerAndCountryChoices.length > 0) {
+      candidates = answerAndCountryChoices;
+    } else {
+      const exactAnswerChoices = choices.filter((choice) => normalize(choice.text || choice.value || "") === answer);
+      if (exactAnswerChoices.length === 0) return null;
+      candidates = exactAnswerChoices;
+    }
+  }
+
+  return findBestChoice(candidates, value);
 }
 
 async function selectComboboxChoice(control, choice) {
@@ -2158,8 +5729,29 @@ async function selectComboboxChoice(control, choice) {
   }
   pressComboboxKey(control, "Enter");
   const selected = await waitForChoiceApplied(control, choice, DROPDOWN_SELECT_TIMEOUT_MS);
-  if (!selected && lastNativeClickError) throw consumeNativeClickError();
+  if (!selected) reportAndClearNativeClickError(control);
   return selected;
+}
+
+function reportAndClearNativeClickError(control) {
+  if (!lastNativeClickError) return;
+  const error = consumeNativeClickError();
+  traceAutoBid("dropdown:native-click-unavailable", {
+    field_id: control?.dataset?.autoBidFieldId || "",
+    message: error.message || String(error)
+  });
+}
+
+async function closeCombobox(control) {
+  if (!control) return;
+  const input = getComboboxInput(control);
+  [input, control, document.activeElement, document.body].filter(Boolean).forEach((target) => {
+    target.dispatchEvent?.(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+    target.dispatchEvent?.(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "Escape", code: "Escape", keyCode: 27, which: 27 }));
+  });
+  input.blur?.();
+  control.blur?.();
+  await sleep(160);
 }
 
 function findCurrentChoiceElement(control, choice, options = getVisibleChoiceElements(control)) {
@@ -2177,7 +5769,7 @@ function findCurrentChoiceElement(control, choice, options = getVisibleChoiceEle
 
 function getVisibleChoiceElements(control) {
   const roots = getComboboxRoots(control);
-  const portalSelector = [
+  const portalSelector = Array.from(new Set([
     "[role='option']",
     "[role='menuitemradio']",
     "[data-radix-collection-item]",
@@ -2185,12 +5777,16 @@ function getVisibleChoiceElements(control) {
     "[cmdk-item]",
     ".select__option",
     "[data-testid*='option' i]",
-    "[id*='option' i]"
-  ].join(",");
+    "[id*='option' i]",
+    ...(atsAdapters?.getOptionSelectors?.() || [])
+  ])).join(",");
   const localSelector = `${portalSelector}, li, button`;
   const scopedRoots = roots.filter((root) => root !== document);
   const scopedOptions = collectChoiceElements(scopedRoots, localSelector, control);
   if (scopedOptions.length > 0) return scopedOptions;
+
+  const scopedGenericOptions = getGenericVisibleChoiceElements(scopedRoots, control);
+  if (scopedGenericOptions.length > 0) return scopedGenericOptions;
 
   const reactSelectId = getReactSelectInstanceId(control);
   if (reactSelectId) {
@@ -2201,7 +5797,91 @@ function getVisibleChoiceElements(control) {
     if (reactOptions.length > 0) return reactOptions;
   }
 
-  return collectChoiceElements([document], portalSelector, control);
+  const portalOptions = collectChoiceElements([document], portalSelector, control);
+  if (portalOptions.length > 0) return portalOptions;
+
+  return getGenericVisibleChoiceElements(getOpenChoiceContainers(control), control);
+}
+
+function getGenericVisibleChoiceElements(roots, control) {
+  return collectChoiceElements(roots.filter(Boolean), [
+    "[role='option']",
+    "[role='menuitem']",
+    "[data-value]",
+    "[class*='option' i]",
+    "[class*='item' i]",
+    "li",
+    "button",
+    "div"
+  ].join(","), control)
+    .filter((option) => isLikelyChoiceRow(option, control));
+}
+
+function getOpenChoiceContainers(control) {
+  const selector = [
+    "[role='listbox']",
+    "[role='menu']",
+    "[aria-expanded='true']",
+    "[class*='listbox' i]",
+    "[class*='dropdown' i]",
+    "[class*='drop-down' i]",
+    "[class*='menu' i]",
+    "[class*='options' i]",
+    "[class*='option-list' i]",
+    "[class*='select-menu' i]",
+    "[class*='select__menu' i]",
+    "[data-radix-popper-content-wrapper]"
+  ].join(",");
+
+  return queryAll(selector)
+    .filter((container) => container !== control && isVisible(container))
+    .filter((container) => isLikelyChoiceContainerForControl(container, control));
+}
+
+function isLikelyChoiceContainerForControl(container, control) {
+  if (container.contains(control)) return true;
+
+  const trigger = getComboboxTrigger(control);
+  const triggerRect = trigger.getBoundingClientRect();
+  const rect = container.getBoundingClientRect();
+  if (rect.width < 80 || rect.height < 20 || rect.height > window.innerHeight * 0.85) return false;
+  if (rect.bottom < triggerRect.top - 24 || rect.top > triggerRect.bottom + 650) return false;
+
+  const horizontalOverlap = Math.max(0, Math.min(rect.right, triggerRect.right) - Math.max(rect.left, triggerRect.left));
+  if (horizontalOverlap < Math.min(60, triggerRect.width * 0.25)) return false;
+
+  const text = normalize(container.textContent || "");
+  return /\b(linkedin|indeed|glassdoor|job board|website|referral|facebook|other)\b/.test(text) ||
+    /\b(select|option|dropdown|menu|listbox)\b/.test(normalize([container.className, container.id, container.getAttribute?.("role")].join(" ")));
+}
+
+function isLikelyChoiceRow(option, control) {
+  if (!option || option === control || option.contains(control) || isLikelyDropdownTrigger(option)) return false;
+  if (option.querySelector?.("input, textarea, select")) return false;
+
+  const text = cleanLabel(option.textContent || option.getAttribute?.("aria-label") || option.getAttribute?.("data-value") || "");
+  const normalized = normalize(text);
+  if (!normalized || text.length > 140) return false;
+  if (/^(search|select|select an option|choose|choose an option|type to search)$/.test(normalized)) return false;
+  if (isPlaceholderChoice(text, option.getAttribute?.("data-value") || option.getAttribute?.("value") || "")) return false;
+
+  const rect = option.getBoundingClientRect();
+  if (rect.width < 40 || rect.height < 8 || rect.height > 96) return false;
+
+  const trigger = getComboboxTrigger(control);
+  const triggerRect = trigger.getBoundingClientRect();
+  if (rect.bottom < triggerRect.top - 24 || rect.top > triggerRect.bottom + 650) return false;
+
+  const horizontalOverlap = Math.max(0, Math.min(rect.right, triggerRect.right) - Math.max(rect.left, triggerRect.left));
+  if (horizontalOverlap < Math.min(40, triggerRect.width * 0.18)) return false;
+
+  const meaningfulChildren = Array.from(option.children || [])
+    .filter((child) => isVisible(child) && cleanLabel(child.textContent || "") && !child.querySelector?.("input, textarea, select"))
+    .filter((child) => {
+      const childRect = child.getBoundingClientRect();
+      return childRect.height >= 8 && childRect.height <= 96 && normalize(child.textContent || "") !== normalized;
+    });
+  return meaningfulChildren.length === 0;
 }
 
 function getComboboxRoots(control) {
@@ -2359,6 +6039,25 @@ async function waitForComboboxOptions(control, timeoutMs) {
   while (Date.now() - started < timeoutMs) {
     options = getVisibleChoiceElements(control);
     if (isComboboxOpen(control) && options.length > 0) return options;
+    await sleep(80);
+  }
+  return options;
+}
+
+async function waitForComboboxFilteredOptions(control, filterValue, timeoutMs) {
+  const started = Date.now();
+  let options = [];
+  while (Date.now() - started < timeoutMs) {
+    options = getVisibleChoiceElements(control)
+      .filter((option) => !isPlaceholderChoice(
+        option.textContent,
+        option.getAttribute("data-value") || option.getAttribute("value") || ""
+      ));
+    const choices = options.map((option) => ({
+      text: option.textContent,
+      value: option.getAttribute("data-value") || option.getAttribute("value") || option.textContent
+    }));
+    if (isComboboxOpen(control) && findBestChoice(choices, filterValue)) return options;
     await sleep(80);
   }
   return options;
@@ -2557,7 +6256,11 @@ function summarizeChoice(choice) {
 
 function resetTrace() {
   autoBidTrace = [];
+  generatedAnswerFillAttempts.clear();
+  autoBidRunId = `abr_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  autoBidRunStartedAt = new Date().toISOString();
   document.documentElement.removeAttribute(DEBUG_ATTR);
+  publishTraceSnapshot("running");
 }
 
 function traceAutoBid(event, data = {}) {
@@ -2569,6 +6272,7 @@ function traceAutoBid(event, data = {}) {
   autoBidTrace.push(entry);
   if (autoBidTrace.length > 240) autoBidTrace.shift();
   console.info("[AutoBid]", event, data);
+  scheduleTracePublish();
 }
 
 function flushTrace() {
@@ -2580,8 +6284,46 @@ function flushTrace() {
       entries: autoBidTrace
     };
     document.documentElement.setAttribute(DEBUG_ATTR, JSON.stringify(payload).slice(0, 120000));
+    const lastEvent = autoBidTrace.at(-1)?.event || "";
+    publishTraceSnapshot(lastEvent === "run:error" ? "failed" : lastEvent === "run:complete" ? "completed" : "running");
   } catch (error) {
     console.warn("Auto Bid could not export debug trace", error);
+  }
+}
+
+function scheduleTracePublish() {
+  if (tracePublishTimer) return;
+  tracePublishTimer = window.setTimeout(() => {
+    tracePublishTimer = null;
+    publishTraceSnapshot("running");
+  }, 500);
+}
+
+function publishTraceSnapshot(status) {
+  if (!autoBidRunId || !isActiveContentInstance()) return;
+  const completeEntry = [...autoBidTrace].reverse().find((entry) => entry.event === "run:complete" || entry.event === "run:error");
+  const completeData = completeEntry?.data || {};
+  const payload = {
+    run_id: autoBidRunId,
+    url: location.href,
+    title: document.title || "",
+    ats: atsAdapters?.describe?.() || { id: "common", name: "Common form" },
+    status,
+    started_at: autoBidRunStartedAt,
+    updated_at: new Date().toISOString(),
+    completed_at: ["completed", "failed", "cancelled"].includes(status) ? new Date().toISOString() : null,
+    summary: {
+      filled: Number(completeData.filled || 0),
+      missed: Number(completeData.missed || 0),
+      submitted: Boolean(completeData.submit?.clicked),
+      message: completeEntry?.event === "run:error" ? String(completeData.message || "Autofill failed") : ""
+    },
+    entries: autoBidTrace
+  };
+  try {
+    chrome.runtime.sendMessage({ type: "AUTOBID_LOG_UPSERT", payload }, () => void chrome.runtime.lastError);
+  } catch (_error) {
+    // Extension reloads can invalidate a content-script context mid-run.
   }
 }
 
@@ -2593,6 +6335,7 @@ function runPageCommand(type, element, extra = {}) {
   document.documentElement.setAttribute("data-auto-bid-command", JSON.stringify({ type, token, ...extra }));
   document.dispatchEvent(new CustomEvent("autoBid:pageCommand"));
   const acknowledged = document.documentElement.getAttribute("data-auto-bid-command-result") === token;
+  document.documentElement.removeAttribute("data-auto-bid-command");
   window.setTimeout(() => {
     if (element.getAttribute("data-auto-bid-bridge-token") === token) {
       element.removeAttribute("data-auto-bid-bridge-token");
@@ -2626,8 +6369,8 @@ function scorePositiveChoice(label, choiceText, index) {
   const bestNumber = numbers.length > 0 ? Math.max(...numbers) : 0;
   const experienceContext = /(experience|years|level|proficiency|skill|expertise|knowledge|familiar|rating|seniority)/.test(normalizedLabel);
   const scaleContext = /(rating|scale|level|proficiency|seniority)/.test(normalizedLabel);
-  const sponsorshipContext = /(sponsor|sponsorship|visa|work permit|work authorization support)/.test(normalizedLabel);
-  const sponsorshipNeedContext = /(require|need|seek|request|support).*(sponsor|sponsorship|visa|work permit)|(sponsor|sponsorship|visa|work permit).*(require|need|support|request)/.test(normalizedLabel);
+  const sponsorshipContext = /(sponsor|sponsorship|visa|work permit|authorization|authorisation|work authorization support|work authorisation support)/.test(normalizedLabel);
+  const sponsorshipNeedContext = /(require|need|seek|request|support).*(sponsor|sponsorship|visa|work permit|authorization|authorisation)|(sponsor|sponsorship|visa|work permit|authorization|authorisation).*(require|need|support|request)/.test(normalizedLabel);
   const workAuthorizationContext = /(authorized|eligible|legally).*(work|employ)|(work|employ).*(authorized|eligible|legally)|without.*(sponsor|sponsorship|visa)/.test(normalizedLabel);
   const salaryComfortContext = /(comfortable|accept|agree|ok|okay).*(salary|compensation|pay|range)|(salary|compensation|pay|range).*(comfortable|accept|agree|ok|okay)/.test(normalizedLabel);
   const positiveYesContext = /(comfortable|authorized|eligible|willing|available|open to|agree|accept|consent|confirm|legally|relocat|remote|can you|able to|do you have|have you|do you use|have you used|use.*ai|ai.*assist|artificial intelligence|development workflow|meet.*requirement|salary|compensation|pay range)/.test(normalizedLabel);
@@ -2636,6 +6379,12 @@ function scorePositiveChoice(label, choiceText, index) {
   let score = 0;
 
   if (/select|choose|please|placeholder|n\/a|not applicable/.test(normalizedChoice)) return -200;
+
+  if (isExperienceYearsLabel(normalizedLabel)) {
+    const targetYears = getExperienceDefaultTargetYears(getExperienceYearsKind(normalizedLabel));
+    const yearScore = scoreExperienceYearsOption(choiceText, targetYears);
+    if (yearScore > 0) return yearScore + index;
+  }
 
   if (sponsorshipContext && sponsorshipNeedContext && !workAuthorizationContext) {
     if (noChoice || /not require|not need|no sponsorship|without sponsorship/.test(normalizedChoice)) return 900 + index;
@@ -2671,7 +6420,11 @@ function isPlaceholderChoice(text, value) {
   const normalizedText = normalize(text);
   const normalizedValue = normalize(value);
   if (!normalizedText && !normalizedValue) return true;
-  return /^(select|choose|please select|placeholder|n a|not applicable)$/.test(normalizedText);
+  return /^(select|choose|please select|placeholder|n a|not applicable|search|type to search|start typing|start searching)$/.test(normalizedText) ||
+    /^(?:start typing|start searching|type to search)(?: no results?)?$/.test(normalizedText) ||
+    /^(no results?|no options?|nothing found|no matches?|no locations? found|no suggestions?)$/.test(normalizedText) ||
+    /^(select|choose)(?: an| a)? option\b/.test(normalizedText) ||
+    (/this field is required/.test(normalizedText) && /\b(select|choose).*\boption\b/.test(normalizedText));
 }
 
 function buildChoiceAliases(text, value) {

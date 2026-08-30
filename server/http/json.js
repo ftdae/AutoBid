@@ -1,3 +1,5 @@
+import { recordHttpResponsePayload } from "../utils/logger.js";
+
 export async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -7,6 +9,7 @@ export async function readJson(req) {
 }
 
 export function sendJson(res, status, payload) {
+  recordHttpResponsePayload(res, payload);
   setCorsHeaders(res);
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(payload));

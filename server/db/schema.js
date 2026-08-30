@@ -74,11 +74,27 @@ export async function ensureSchema(pool) {
       check (status in ('draft', 'filled', 'submitted'))
     );
 
+    create table if not exists auto_bid_outlook_connections (
+      user_id text primary key references auto_bid_users(id) on delete cascade,
+      microsoft_user_id text not null,
+      tenant_id text,
+      email text,
+      display_name text,
+      access_token_encrypted text not null,
+      refresh_token_encrypted text not null,
+      token_expires_at timestamptz not null,
+      scopes text[] not null default '{}',
+      active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
     create index if not exists auto_bid_profiles_user_active_idx on auto_bid_profiles(user_id, active);
     create index if not exists auto_bid_questions_domain_scope_idx on auto_bid_questions(domain, cache_scope);
     create index if not exists auto_bid_answer_cache_question_scope_idx on auto_bid_answer_cache(question_hash, cache_scope, created_at desc);
     create index if not exists auto_bid_answer_cache_profile_idx on auto_bid_answer_cache(profile_id, profile_version);
     create index if not exists auto_bid_drafts_user_created_idx on auto_bid_application_drafts(user_id, created_at desc);
     create index if not exists auto_bid_drafts_profile_created_idx on auto_bid_application_drafts(profile_id, created_at desc);
+    create index if not exists auto_bid_outlook_connections_active_idx on auto_bid_outlook_connections(active, updated_at desc);
   `);
 }

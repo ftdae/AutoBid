@@ -18,7 +18,7 @@
       return;
     }
 
-    const element = document.querySelector(`[data-auto-bid-bridge-token="${cssEscape(command.token)}"]`);
+    const element = queryDeep(`[data-auto-bid-bridge-token="${cssEscape(command.token)}"]`);
     if (!element) return;
 
     if (command.type === "click") dispatchRealisticMouseClick(element);
@@ -37,6 +37,9 @@
     if (command.type === "combobox-toggle") element.click();
     if (command.type === "combobox-choose" && !callReactHandlers(element, ["onClick"], "click")) {
       dispatchClick(element);
+    }
+    if (command.type === "file-upload") {
+      uploadFile(element, command.file || {});
     }
     getRoot()?.setAttribute("data-auto-bid-command-result", command.token);
   });
@@ -63,6 +66,176 @@
     element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     callReactHandlers(element, ["onChange"], "change");
+  }
+
+  function uploadFile(input, payload) {
+    if (!input || !input.matches?.("input[type='file']")) return false;
+
+    const file = fileFromBase64(payload);
+    if (!file) return false;
+
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    setInputFiles(input, transfer.files);
+    input.focus?.();
+
+    dispatchFileInput(input, transfer, "input");
+    dispatchFileInput(input, transfer, "change");
+    const inputHandled = callReactHandlers(input, ["onInput"], "input", { dataTransfer: transfer }) ||
+      callReactHandlers(input, ["onChange"], "change", { dataTransfer: transfer });
+
+    if (!inputHandled) {
+      const target = getFileDropTargets(input)[0];
+      if (target) {
+        dispatchFileDrop(target, transfer, "dragenter");
+        dispatchFileDrop(target, transfer, "dragover");
+        callReactHandlers(target, ["onDragEnter"], "dragenter", { dataTransfer: transfer });
+        callReactHandlers(target, ["onDragOver"], "dragover", { dataTransfer: transfer });
+        dispatchFileDrop(target, transfer, "drop");
+        callReactHandlers(target, ["onDrop"], "drop", { dataTransfer: transfer });
+      }
+    }
+
+    input.blur?.();
+    return true;
+  }
+
+  function fileFromBase64(payload) {
+    const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "");
+    if (!base64) return null;
+
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+
+    const name = sanitizeFilename(payload.name || payload.filename || "resume.pdf");
+    const type = String(payload.mime_type || payload.mimeType || "application/pdf").trim() || "application/pdf";
+    return new File([bytes], name, { type });
+  }
+
+  function sanitizeFilename(value) {
+    return String(value || "resume.pdf").replace(/[\\/:*?"<>|]+/g, "_").trim() || "resume.pdf";
+  }
+
+  function setInputFiles(input, files) {
+    try {
+      input.files = files;
+      return;
+    } catch (_error) {
+      // Some frameworks wrap file inputs; defineProperty is a fallback for their event handlers.
+    }
+
+    try {
+      Object.defineProperty(input, "files", {
+        configurable: true,
+        get() {
+          return files;
+        }
+      });
+    } catch (_error) {
+      // If this also fails, the dispatched drop events still carry the file list.
+    }
+  }
+
+  function dispatchFileInput(input, transfer, type) {
+    const event = new Event(type, { bubbles: true, cancelable: true, composed: true });
+    defineFileEventProperties(event, input, transfer);
+    input.dispatchEvent(event);
+  }
+
+  function dispatchFileDrop(target, transfer, type) {
+    let event;
+    try {
+      event = new DragEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        dataTransfer: transfer
+      });
+    } catch (_error) {
+      event = new Event(type, { bubbles: true, cancelable: true, composed: true });
+    }
+    defineFileEventProperties(event, target, transfer);
+    target.dispatchEvent(event);
+  }
+
+  function defineFileEventProperties(event, target, transfer) {
+    defineReadonly(event, "target", target);
+    defineReadonly(event, "currentTarget", target);
+    defineReadonly(event, "dataTransfer", transfer);
+  }
+
+  function defineReadonly(object, property, value) {
+    try {
+      Object.defineProperty(object, property, { configurable: true, value });
+    } catch (_error) {
+      // Native event implementations may prevent overriding some properties.
+    }
+  }
+
+  function getFileDropTargets(input) {
+    const candidates = [
+      input.closest("label"),
+      input.closest("fieldset"),
+      input.closest("[class*='upload' i], [class*='dropzone' i], [class*='drop-zone' i], [class*='attachment' i], [class*='resume' i], [class*='cv' i], [data-testid*='upload' i], [data-testid*='drop' i], [data-testid*='file' i]"),
+      findNearestUploadZone(input),
+      input.parentElement,
+      input
+    ].filter(Boolean);
+    return Array.from(new Set(candidates));
+  }
+
+  function findNearestUploadZone(input) {
+    const zones = Array.from(document.querySelectorAll([
+      "label",
+      "fieldset",
+      "[role='button']",
+      "[class*='upload' i]",
+      "[class*='dropzone' i]",
+      "[class*='drop-zone' i]",
+      "[class*='attachment' i]",
+      "[class*='resume' i]",
+      "[class*='cv' i]",
+      "[data-testid*='upload' i]",
+      "[data-testid*='drop' i]",
+      "[data-testid*='file' i]"
+    ].join(","))).filter((element) => isResumeUploadZoneText(element.textContent || element.getAttribute?.("aria-label") || ""));
+
+    if (zones.length === 0) return null;
+    const inputForm = input.closest("form");
+    return zones
+      .map((zone) => ({
+        zone,
+        score: (zone.contains(input) ? 1000 : 0) +
+          (inputForm && zone.closest("form") === inputForm ? 200 : 0) +
+          (input.parentElement && zone.parentElement === input.parentElement ? 120 : 0)
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) => right.score - left.score)[0]?.zone || zones[0];
+  }
+
+  function isResumeUploadZoneText(value) {
+    const text = normalizeText(value);
+    if (!text || /(cover letter|motivation letter|portfolio|photo|avatar|image|transcript|certificate)/.test(text)) return false;
+    return (/\b(resume|cv|curriculum vitae)\b/.test(text) &&
+      /\b(upload|attach|attachment|file|drop|drag|browse|choose)\b/.test(text)) ||
+      isGenericApplicationFileUploadText(text);
+  }
+
+  function isGenericApplicationFileUploadText(value) {
+    const text = normalizeText(value);
+    if (!text || /(cover letter|motivation letter|dropbox|google drive|drive|manual|manually|paste|photo|avatar|image|portfolio|certificate|transcript)/.test(text)) {
+      return false;
+    }
+    const hasGenericUpload = /\b(choose|select|upload|attach|browse|drop|drag)\b.*\bfile\b|\bfile\b.*\b(drop|upload|attach|browse|choose|select)\b/.test(text);
+    if (!hasGenericUpload) return false;
+    return /\b(easy apply|autocomplete your application|application|personal information|apply|mb size limit|size limit|pdf|doc|docx|rtf|txt)\b/.test(text);
+  }
+
+  function normalizeText(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   }
 
   function dispatchKey(element, key) {
@@ -173,8 +346,10 @@
         keyCode,
         which: keyCode,
         clientX,
-        clientY
+        clientY,
+        dataTransfer: extra.dataTransfer || undefined
       },
+      dataTransfer: extra.dataTransfer || undefined,
       preventDefault() {
         this.defaultPrevented = true;
       },
@@ -230,6 +405,27 @@
   function cssEscape(value) {
     if (window.CSS?.escape) return CSS.escape(value);
     return String(value || "").replace(/["\\]/g, "\\$&");
+  }
+
+  function queryDeep(selector, root = document) {
+    const stack = [root];
+    const seen = new Set();
+
+    while (stack.length) {
+      const current = stack.shift();
+      if (!current || seen.has(current)) continue;
+      seen.add(current);
+
+      if (current.matches?.(selector)) return current;
+      const match = current.querySelector?.(selector);
+      if (match) return match;
+
+      current.querySelectorAll?.("*").forEach((element) => {
+        if (element.shadowRoot) stack.push(element.shadowRoot);
+      });
+    }
+
+    return null;
   }
 
   function getRoot() {

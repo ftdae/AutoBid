@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoBid Answer Worker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <h1>AutoBid Answers</h1>
+        <p id="stateLabel">Idle</p>
+      </header>
+
+      <section>
+        <label>
+          Apps Script Web App URL
+          <input id="appsScriptUrl" type="url" placeholder="https://script.google.com/macros/s/.../exec" />
+        </label>
+        <label>
+          Extension Secret
+          <input id="secret" type="password" placeholder="Shared Apps Script secret" />
+        </label>
+      </section>
+
+      <section class="grid">
+        <label>
+          Sheet tab
+          <input id="sheetName" placeholder="e.g. Jobs" />
+        </label>
+        <label>
+          Start row
+          <input id="startRow" type="number" min="2" value="2" />
+        </label>
+        <label>
+          End row
+          <input id="endRow" type="number" min="2" value="2" />
+        </label>
+        <label>
+          Max rows/run
+          <input id="maxRowsPerRun" type="number" min="1" max="50" value="10" />
+        </label>
+      </section>
+
+      <section class="actions">
+        <button id="saveButton">Save</button>
+        <button id="runOnceButton" class="primary">Run once</button>
+        <button id="startButton">Start loop</button>
+        <button id="stopButton">Stop</button>
+      </section>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

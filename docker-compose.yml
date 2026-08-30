@@ -2,14 +2,24 @@ services:
   db:
     image: postgres:16
     restart: unless-stopped
+    network_mode: host
+    command:
+      - postgres
+      - -p
+      - "5433"
+      - -c
+      - listen_addresses=127.0.0.1
     environment:
       POSTGRES_DB: autobid
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports:
-      - "5433:5432"
     volumes:
       - autobid_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U postgres -d autobid"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   autobid_postgres_data:

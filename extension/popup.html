@@ -4,6 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Auto Bid</title>
+    <script>
+      const surface = new URLSearchParams(location.search).get("surface");
+      if (["panel", "window", "options"].includes(surface)) {
+        document.documentElement.dataset.surface = surface;
+      }
+    </script>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
@@ -13,72 +19,219 @@
           <h1>Auto Bid</h1>
           <p id="sessionLabel">Not connected</p>
         </div>
-        <button id="logoutButton" class="hidden" title="Log out">Log out</button>
+        <div class="header-actions">
+          <button id="logoutButton" class="hidden" title="Log out">Log out</button>
+          <button id="closePanelButton" class="panel-only icon-button" title="Close panel" aria-label="Close panel">x</button>
+        </div>
       </header>
 
-      <section class="section">
-        <label for="apiBase">API server</label>
-        <div class="row">
-          <input id="apiBase" type="url" placeholder="http://localhost:7003" />
-          <button id="saveSettingsButton">Save</button>
-        </div>
-      </section>
+      <nav class="workspace-tabs" aria-label="Auto Bid views">
+        <button class="workspace-tab active" data-view="dashboard">Dashboard</button>
+        <button class="workspace-tab" data-view="profiles">Profiles</button>
+        <button class="workspace-tab" data-view="outlook">Outlook</button>
+        <button class="workspace-tab" data-view="log">Log</button>
+        <button class="workspace-tab" data-view="settings">Settings</button>
+      </nav>
 
-      <section id="authSection" class="section hidden">
-        <div class="tabs">
-          <button id="loginTab" class="active">Login</button>
-          <button id="signupTab">Sign up</button>
-        </div>
-        <div id="signupNames" class="grid hidden">
-          <label>First name<input id="firstName" autocomplete="given-name" /></label>
-          <label>Last name<input id="lastName" autocomplete="family-name" /></label>
-        </div>
-        <label>Email<input id="email" type="email" autocomplete="email" /></label>
-        <label>Password<input id="password" type="password" autocomplete="current-password" /></label>
-        <button id="authButton" class="primary">Login</button>
-      </section>
+      <div id="dashboardView" class="view-panel active" data-view-panel="dashboard">
+        <section class="section command-section">
+          <div class="section-heading">
+            <div>
+              <h2>Current application</h2>
+              <p>Run the local profile, resume, ATS, and answer pipeline.</p>
+            </div>
+            <span id="dashboardRunState" class="state-badge idle">Idle</span>
+          </div>
+          <button id="runAutofillButton" class="primary command-button">Run autofill</button>
+          <div id="latestRunSummary" class="summary-grid" aria-live="polite">
+            <div><strong>0</strong><span>Filled</span></div>
+            <div><strong>0</strong><span>Skipped</span></div>
+            <div><strong>Common</strong><span>Form engine</span></div>
+          </div>
+        </section>
 
-      <section id="profileSection" class="section">
-        <div class="row">
-          <select id="profileSelect"></select>
-          <button id="newProfileButton">New</button>
-        </div>
+        <section class="section">
+          <div class="section-heading">
+            <div>
+              <h2>Job batch</h2>
+              <p>Open the configured Sheet rows in background tabs.</p>
+            </div>
+          </div>
+          <div class="compact-sheet-summary">
+            <span id="dashboardSheetName">No sheet selected</span>
+            <span id="dashboardSheetRows">Rows 2-2</span>
+          </div>
+          <button id="dashboardOpenRowsButton">Open configured rows</button>
+        </section>
 
-        <label>Profile name<input id="profileName" /></label>
-        <div class="grid">
-          <label>First name<input data-static-key="first_name" /></label>
-          <label>Last name<input data-static-key="last_name" /></label>
-          <label>Full name<input data-static-key="full_name" /></label>
-          <label>Email<input data-static-key="email" type="email" /></label>
-          <label>Phone<input data-static-key="phone" /></label>
-          <label>Location<input data-static-key="location" /></label>
-          <label>City<input data-static-key="city" /></label>
-          <label>Country<input data-static-key="country" /></label>
-          <label>Languages<input data-static-key="languages" placeholder="e.g. English, Polish" /></label>
-          <label>LinkedIn<input data-static-key="linkedin" /></label>
-          <label>GitHub<input data-static-key="github" /></label>
-          <label>Portfolio<input data-static-key="portfolio" /></label>
-          <label>Website<input data-static-key="website" /></label>
-          <label>Expected salary / rate<input data-static-key="expected_rate" placeholder="e.g. 5500 EUR monthly" /></label>
-          <label>Work authorization<input data-static-key="work_authorization" /></label>
-          <label>Sponsorship<input data-static-key="sponsorship" /></label>
-          <label>Availability<input data-static-key="availability" /></label>
-          <label>Notice period<input data-static-key="notice_period" placeholder="e.g. Immediate, 2 weeks, 30 days" /></label>
-        </div>
+        <section class="section">
+          <div class="section-heading">
+            <div>
+              <h2>Latest activity</h2>
+              <p id="latestRunMessage">No autofill runs recorded yet.</p>
+            </div>
+            <button id="dashboardOpenLogButton" class="quiet-button">View log</button>
+          </div>
+        </section>
+      </div>
 
-        <label>Resume / profile context<textarea id="resumeText" rows="6"></textarea></label>
-        <div class="grid">
-          <label>Tone<input id="tone" placeholder="direct, confident, concise" /></label>
-          <label>Bid style<input id="bidStyle" placeholder="short proposal, detailed proposal" /></label>
-        </div>
+      <div id="profilesView" class="view-panel" data-view-panel="profiles">
+        <section id="authSection" class="section hidden">
+          <div class="tabs">
+            <button id="loginTab" class="active">Login</button>
+            <button id="signupTab">Sign up</button>
+          </div>
+          <div id="signupNames" class="grid hidden">
+            <label>First name<input id="firstName" autocomplete="given-name" /></label>
+            <label>Last name<input id="lastName" autocomplete="family-name" /></label>
+          </div>
+          <label>Email<input id="email" type="email" autocomplete="email" /></label>
+          <label>Password<input id="password" type="password" autocomplete="current-password" /></label>
+          <button id="authButton" class="primary">Login</button>
+        </section>
 
-        <div class="row">
-          <button id="saveProfileButton" class="primary">Save profile</button>
-          <button id="deleteProfileButton" class="danger">Delete</button>
-        </div>
-      </section>
+        <section id="profileSection" class="section">
+          <div class="section-heading">
+            <div>
+              <h2>Applicant profile</h2>
+              <p>Static answers stay local to the selected profile.</p>
+            </div>
+          </div>
+          <div class="row">
+            <select id="profileSelect"></select>
+            <button id="newProfileButton">New</button>
+          </div>
 
-      <p id="status" class="status"></p>
+          <label>Profile name<input id="profileName" /></label>
+          <div class="grid">
+            <label>First name<input data-static-key="first_name" /></label>
+            <label>Last name<input data-static-key="last_name" /></label>
+            <label>Full name<input data-static-key="full_name" /></label>
+            <label>Email<input data-static-key="email" type="email" /></label>
+            <label>Phone<input data-static-key="phone" /></label>
+            <label>Location<input data-static-key="location" /></label>
+            <label>City<input data-static-key="city" /></label>
+            <label>State / Province / Region<input data-static-key="state_region" autocomplete="address-level1" /></label>
+            <label>Postal Code / ZIP Code<input data-static-key="postal_code" autocomplete="postal-code" /></label>
+            <label>Country<input data-static-key="country" /></label>
+            <label>Citizenship / nationality<input data-static-key="nationality" /></label>
+            <label>Languages<input data-static-key="languages" placeholder="e.g. English, Polish" /></label>
+            <label>LinkedIn<input data-static-key="linkedin" /></label>
+            <label>GitHub<input data-static-key="github" /></label>
+            <label>Portfolio<input data-static-key="portfolio" /></label>
+            <label>Website<input data-static-key="website" /></label>
+            <label>Expected salary / rate<input data-static-key="expected_rate" placeholder="e.g. 5500 EUR monthly" /></label>
+            <label>Work authorization<input data-static-key="work_authorization" /></label>
+            <label>Sponsorship<input data-static-key="sponsorship" /></label>
+            <label>Availability<input data-static-key="availability" /></label>
+            <label>Notice period<input data-static-key="notice_period" placeholder="e.g. Immediate, 2 weeks, 30 days" /></label>
+          </div>
+
+          <label>Resume / profile context<textarea id="resumeText" rows="6"></textarea></label>
+          <div class="grid">
+            <label>Tone<input id="tone" placeholder="direct, confident, concise" /></label>
+            <label>Bid style<input id="bidStyle" placeholder="short proposal, detailed proposal" /></label>
+          </div>
+
+          <div class="row">
+            <button id="saveProfileButton" class="primary">Save profile</button>
+            <button id="deleteProfileButton" class="danger">Delete</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="outlookView" class="view-panel" data-view-panel="outlook">
+        <section class="section">
+          <div class="section-heading">
+            <div>
+              <h2>Outlook verification</h2>
+              <p>Read recent application-account verification messages from Inbox and Junk.</p>
+            </div>
+            <span id="outlookState" class="state-badge idle">Not connected</span>
+          </div>
+          <div id="outlookIdentity" class="connection-identity hidden"></div>
+          <div class="row wrap-row">
+            <button id="connectOutlookButton" class="primary">Connect Outlook</button>
+            <button id="disconnectOutlookButton" class="danger hidden">Disconnect</button>
+            <button id="refreshOutlookButton" class="hidden">Refresh inbox</button>
+          </div>
+          <p id="outlookStatus" class="status inline-status"></p>
+        </section>
+        <section id="outlookMessagesSection" class="section hidden">
+          <div class="section-heading">
+            <div>
+              <h2>Verification messages</h2>
+              <p>Recent likely matches, newest and most relevant first.</p>
+            </div>
+          </div>
+          <div id="outlookMessages" class="message-list"></div>
+        </section>
+      </div>
+
+      <div id="logView" class="view-panel" data-view-panel="log">
+        <section class="section log-toolbar">
+          <div class="section-heading">
+            <div>
+              <h2>Execution log</h2>
+              <p>Each tab and frame keeps its own trace.</p>
+            </div>
+            <div class="row">
+              <button id="refreshLogsButton" title="Refresh execution log">Refresh</button>
+              <button id="clearLogsButton" class="danger" title="Clear execution log">Clear</button>
+            </div>
+          </div>
+        </section>
+        <div id="executionLogs" class="execution-logs" aria-live="polite"></div>
+      </div>
+
+      <div id="settingsView" class="view-panel" data-view-panel="settings">
+        <section class="section">
+          <div class="section-heading">
+            <div>
+              <h2>API connection</h2>
+              <p>Local server used for profiles, AI, Sheets, and Outlook.</p>
+            </div>
+          </div>
+          <label for="apiBase">API server</label>
+          <div class="row">
+            <input id="apiBase" type="url" placeholder="http://localhost:7003" />
+            <button id="saveSettingsButton">Save</button>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <div>
+              <h2>Google Sheet</h2>
+              <p>Map a row range to job tabs and tailored resumes.</p>
+            </div>
+          </div>
+          <label>Google spreadsheet ID or URL<input id="spreadsheetId" placeholder="Optional when using Apps Script bridge" /></label>
+          <div class="grid">
+            <label>Sheet tab<input id="sheetName" placeholder="e.g. Jobs" /></label>
+            <label>Rows<input id="sheetRowsLabel" value="Start / end" disabled /></label>
+            <label>Start row<input id="sheetStartRow" type="number" min="2" value="2" /></label>
+            <label>End row<input id="sheetEndRow" type="number" min="2" value="2" /></label>
+          </div>
+          <div class="row wrap-row">
+            <button id="saveSheetButton">Save sheet</button>
+            <button id="openSheetRowsButton" class="primary">Open</button>
+          </div>
+          <p id="sheetStatus" class="status inline-status"></p>
+        </section>
+
+        <section class="section window-only">
+          <div class="section-heading">
+            <div>
+              <h2>Options dashboard</h2>
+              <p>Open the full-width settings surface.</p>
+            </div>
+            <button id="openOptionsButton">Open options</button>
+          </div>
+        </section>
+      </div>
+
+      <p id="status" class="status global-status"></p>
     </main>
     <script src="popup.js"></script>
   </body>
