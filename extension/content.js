@@ -7208,21 +7208,45 @@ function findBestAutocompleteChoice(choices, value, field, context = {}) {
 }
 
 async function selectComboboxChoice(control, choice) {
-  const option = findCurrentChoiceElement(control, choice);
+  let option = findCurrentChoiceElement(control, choice);
   if (!option) return false;
 
-  await clickChoice(option);
+  const nativeClicked = await clickChoice(option);
   if (await waitForChoiceApplied(control, choice, DROPDOWN_SELECT_TIMEOUT_MS)) return true;
+  traceAutoBid("dropdown:select-not-committed", describeComboboxState(control, {
+    stage: "page-pointer-sequence",
+    nativeClicked,
+    expected: cleanLabel(choice.text || choice.value || "")
+  }));
 
-  const options = await openCombobox(control);
-  const retryOption = findCurrentChoiceElement(control, choice, options);
+  let options = await openCombobox(control);
+  let retryOption = findCurrentChoiceElement(control, choice, options);
   if (retryOption) {
-    await clickChoice(retryOption);
+    const pageReactClick = runPageCommand("combobox-choose", retryOption);
     if (await waitForChoiceApplied(control, choice, DROPDOWN_SELECT_TIMEOUT_MS)) return true;
+    traceAutoBid("dropdown:select-not-committed", describeComboboxState(control, {
+      stage: "react-click-handler",
+      pageReactClick,
+      expected: cleanLabel(choice.text || choice.value || "")
+    }));
   }
 
+  options = await openCombobox(control);
+  retryOption = findCurrentChoiceElement(control, choice, options);
+  if (retryOption) {
+    const pageReactMouseDown = runPageCommand("combobox-choose-mousedown", retryOption);
+    if (await waitForChoiceApplied(control, choice, DROPDOWN_SELECT_TIMEOUT_MS)) return true;
+    traceAutoBid("dropdown:select-not-committed", describeComboboxState(control, {
+      stage: "react-mousedown-handler",
+      pageReactMouseDown,
+      expected: cleanLabel(choice.text || choice.value || "")
+    }));
+  }
+
+  options = await openCombobox(control);
+  option = findCurrentChoiceElement(control, choice, options) || option;
   const input = getComboboxInput(control);
-  const expectedOptionId = retryOption?.id || option.id;
+  const expectedOptionId = option?.id || "";
   const steps = Math.max(options.length + 1, Number.isInteger(choice.index) ? choice.index + 2 : 2);
   for (let index = 0; index < steps; index += 1) {
     if (expectedOptionId && input.getAttribute("aria-activedescendant") === expectedOptionId) break;
@@ -7429,9 +7453,7 @@ function getComboboxRoots(control) {
 async function clickChoice(option) {
   await scrollElementIntoView(option, "nearest");
   const target = option.closest("[role='option'], [role='menuitemradio'], [data-value], .select__option, li, button") || option;
-  if (!await nativeClickElement(target)) {
-    runPageCommand("combobox-choose", target);
-  }
+  return nativeClickElement(target);
 }
 
 async function nativeClickElement(element) {

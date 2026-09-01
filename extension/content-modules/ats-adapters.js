@@ -72,9 +72,9 @@
     adapter("greenhouse", "Greenhouse", [/(^|\.)greenhouse\.io$/i, /(^|\.)greenhouse\.com$/i], {
       markers: ["#application-form", "[data-source='greenhouse']", ".application--questions"],
       controls: ["#application-form input", "#application-form textarea", "#application-form select", "#application-form [role='combobox']", ".application--questions [aria-haspopup='listbox']"],
-      containers: [".field", ".application-question", "[data-testid*='field']", "fieldset"],
-      labels: [".field-label", ".application-question label", "[data-testid*='label']", "legend"],
-      options: ["[id*='react-select'][id*='option']", ".select__option", "[data-testid*='option']"],
+      containers: [".field-wrapper", ".select__container", ".field", ".application-question", "[data-testid*='field']", "fieldset"],
+      labels: ["label.select__label", ".field-label", ".application-question label", "[data-testid*='label']", ".label", "legend"],
+      options: ["[id^='react-select-'][id*='-option-']", "[id*='react-select'][id*='option']", ".select__option", "[data-testid*='option']"],
       uploads: ["#resume", "input[name*='resume' i]", "input[id*='resume' i]"]
     }),
     adapter("newrocket", "NewRocket Greenhouse", [/(^|\.)newrocket\.com$/i], {

@@ -1039,8 +1039,37 @@ function clickPagePoint(payload) {
   const control = target?.closest?.("button, [role='button'], [role='option'], [role='radio'], [role='checkbox'], input, label, a") || target;
   if (!control) return { clicked: false, reason: "No control was found at the requested position" };
   control.focus?.({ preventScroll: true });
-  control.click?.();
-  return { clicked: true, method: "page-click" };
+  const rect = control.getBoundingClientRect?.() || {
+    left: Number(payload.x),
+    top: Number(payload.y),
+    width: 0,
+    height: 0
+  };
+  const clientX = Number.isFinite(Number(payload.x)) ? Number(payload.x) : rect.left + rect.width / 2;
+  const clientY = Number.isFinite(Number(payload.y)) ? Number(payload.y) : rect.top + rect.height / 2;
+  const base = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    clientX,
+    clientY,
+    screenX: clientX,
+    screenY: clientY,
+    button: 0,
+    buttons: 1
+  };
+  if (typeof PointerEvent === "function") {
+    control.dispatchEvent(new PointerEvent("pointerdown", { ...base, pointerType: "mouse" }));
+  }
+  control.dispatchEvent(new MouseEvent("mousedown", base));
+  if (typeof PointerEvent === "function") {
+    control.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0, pointerType: "mouse" }));
+  }
+  control.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+  if (typeof control.click === "function") control.click();
+  else control.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
+  return { clicked: true, method: "page-pointer-sequence" };
 }
 
 async function dispatchNativeType(tabId, payload) {

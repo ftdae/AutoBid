@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_HELPER_BUILD_ID = "2026-09-01-idempotent-upload-v3";
+  const PAGE_HELPER_BUILD_ID = "2026-09-01-react-select-v4";
   const previousController = window.__autoBidPageHelperController;
   if (
     window.__autoBidPageHelperBuildId === PAGE_HELPER_BUILD_ID &&
@@ -54,7 +54,12 @@
     }
     if (command.type === "combobox-toggle") element.click();
     if (command.type === "combobox-choose" && !callReactHandlers(element, ["onClick"], "click")) {
-      dispatchClick(element);
+      dispatchRealisticMouseClick(element);
+    }
+    if (command.type === "combobox-choose-mousedown") {
+      const handled = callReactHandlers(element, ["onPointerDown"], "pointerdown") ||
+        callReactHandlers(element, ["onMouseDown"], "mousedown");
+      if (!handled) dispatchMouseDown(element);
     }
     if (command.type === "file-upload") {
       uploadFile(element, command.file || {});

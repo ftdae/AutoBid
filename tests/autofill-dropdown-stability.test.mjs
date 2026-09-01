@@ -7,6 +7,7 @@ const backgroundSource = await readFile(new URL("../extension/background.js", im
 const gptWorkerSource = await readFile(new URL("../extension/gpt-answer-worker.js", import.meta.url), "utf8");
 const manifestSource = await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8");
 const atsAdapterSource = await readFile(new URL("../extension/content-modules/ats-adapters.js", import.meta.url), "utf8");
+const pageHelperSource = await readFile(new URL("../extension/page-helper.js", import.meta.url), "utf8");
 
 test("generated answers stop retrying a field after three failed fills", () => {
   assert.match(contentSource, /const MAX_FIELD_FILL_ATTEMPTS = 3;/);
@@ -222,6 +223,35 @@ test("a native click is verified and falls back to the page bridge before keyboa
   assert.match(openComboboxSource, /runPageCommand\("combobox-open", trigger\)/);
   assert.match(openComboboxSource, /dropdown:open-after-page-bridge/);
   assert.match(openComboboxSource, /for \(const key of \["ArrowDown", " "\]\)/);
+});
+
+test("React-select options use state-verified pointer, React, mouse-down, and keyboard fallbacks", () => {
+  const selectionSource = contentSource.slice(
+    contentSource.indexOf("async function selectComboboxChoice"),
+    contentSource.indexOf("function reportAndClearNativeClickError")
+  );
+  assert.match(selectionSource, /await waitForChoiceApplied\(control, choice, DROPDOWN_SELECT_TIMEOUT_MS\)/);
+  assert.match(selectionSource, /runPageCommand\("combobox-choose", retryOption\)/);
+  assert.match(selectionSource, /runPageCommand\("combobox-choose-mousedown", retryOption\)/);
+  assert.match(selectionSource, /dropdown:select-not-committed/);
+  assert.match(selectionSource, /pressComboboxKey\(control, "Enter"\)/);
+
+  assert.match(backgroundSource, /new PointerEvent\("pointerdown"/);
+  assert.match(backgroundSource, /new MouseEvent\("mousedown"/);
+  assert.match(backgroundSource, /method: "page-pointer-sequence"/);
+  assert.match(pageHelperSource, /PAGE_HELPER_BUILD_ID = "2026-09-01-react-select-v4"/);
+  assert.match(pageHelperSource, /command\.type === "combobox-choose-mousedown"/);
+});
+
+test("Greenhouse React-select fields retain wrapper help text and exact portal options", () => {
+  const greenhouseAdapterSource = atsAdapterSource.slice(
+    atsAdapterSource.indexOf('adapter("greenhouse"'),
+    atsAdapterSource.indexOf('adapter("newrocket"')
+  );
+  assert.match(greenhouseAdapterSource, /containers: \["\.field-wrapper", "\.select__container"/);
+  assert.match(greenhouseAdapterSource, /label\.select__label/);
+  assert.match(greenhouseAdapterSource, /\[id\^='react-select-'\]\[id\*='-option-'\]/);
+  assert.match(contentSource, /help_text: getGeneratedFieldHelpText\(controls\[0\], question\)/);
 });
 
 test("plain-text based-in questions receive a local Yes or No answer", () => {
