@@ -77,7 +77,31 @@ test("semantic availability questions are not claimed by saved start availabilit
 
 test("required checkbox groups inherit the star from their question label", () => {
   assert.match(contentSource, /required: isRequired\(control\) \|\| Boolean\(choiceQuestionLabel && \/\\\*\/\.test\(choiceQuestionLabel\)\)/);
+  assert.match(contentSource, /function getCheckboxGroupQuestionLabel/);
+  assert.match(contentSource, /getCheckboxGroupQuestionLabel\(control, checkboxGroups\.get\(checkboxName\) \|\| \[control\]\)/);
   assert.match(contentSource, /runtime-gpt:candidates-selected/);
+});
+
+test("Recruitee textareas keep their own visual question instead of a broad Questions section label", () => {
+  const fieldLabelSource = contentSource.slice(
+    contentSource.indexOf("function getFieldLabel"),
+    contentSource.indexOf("function getNearbyText")
+  );
+  const recruiteeAdapterSource = atsAdapterSource.slice(
+    atsAdapterSource.indexOf('adapter("recruitee"'),
+    atsAdapterSource.indexOf('adapter("smartrecruiters"')
+  );
+  assert.match(contentSource, /function getVisualFieldLabel/);
+  assert.match(fieldLabelSource, /visualLabel,[\s\S]*getLabelCandidates/);
+  assert.match(contentSource, /const question = getPlainQuestionText\(visibleQuestion \|\| field\.question \|\| field\.label\)/);
+  assert.doesNotMatch(recruiteeAdapterSource, /"\.question"/);
+});
+
+test("bare boolean answers cannot be written into non-boolean narrative fields", () => {
+  assert.match(contentSource, /function isSuspiciousNarrativeBooleanAnswer/);
+  assert.match(contentSource, /function isSemanticBooleanQuestion/);
+  assert.match(contentSource, /answer:rejected-narrative-boolean/);
+  assert.match(contentSource, /getVisualFieldLabel\(first\)/);
 });
 
 test("dynamic dropdown options are collected before an AI request", () => {

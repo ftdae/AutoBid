@@ -614,6 +614,15 @@ function collectFields() {
   const controls = getFormControls().filter(isFillableControl);
   const fields = [];
   const radioGroups = new Map();
+  const checkboxGroups = new Map();
+
+  controls.forEach((control) => {
+    if (getControlType(control) !== "checkbox") return;
+    const name = cleanLabel(control.name || control.getAttribute?.("name") || "");
+    if (!name) return;
+    if (!checkboxGroups.has(name)) checkboxGroups.set(name, []);
+    checkboxGroups.get(name).push(control);
+  });
 
   controls.forEach((control, index) => {
     const type = getControlType(control);
@@ -624,9 +633,18 @@ function collectFields() {
       return;
     }
 
-    const id = `ab_${index}_${hashSmall(getFieldText(control))}`;
     const label = getFieldLabel(control);
-    const choiceQuestionLabel = type === "checkbox" ? getChoiceQuestionLabel(control) : "";
+    const id = `ab_${index}_${hashSmall([
+      label,
+      control.name,
+      control.id,
+      control.getAttribute("placeholder"),
+      control.getAttribute("autocomplete")
+    ].filter(Boolean).join(" "))}`;
+    const checkboxName = cleanLabel(control.name || control.getAttribute?.("name") || "");
+    const choiceQuestionLabel = type === "checkbox"
+      ? getCheckboxGroupQuestionLabel(control, checkboxGroups.get(checkboxName) || [control])
+      : "";
     const question = getPlainQuestionText(choiceQuestionLabel || label);
     const option = type === "checkbox" ? getCheckboxOptionLabel(control, question) : "";
     control.dataset.autoBidFieldId = id;
@@ -1130,16 +1148,19 @@ function getFieldLabel(control) {
       .map((label) => label.textContent)
     : [];
   const siblingLabels = getSiblingLabelCandidates(control);
-  const choiceLabels = ["checkbox", "radio"].includes(getControlType(control)) ? getChoiceInlineLabelCandidates(control) : [];
+  const isChoiceControl = ["checkbox", "radio"].includes(getControlType(control));
+  const choiceLabels = isChoiceControl ? getChoiceInlineLabelCandidates(control) : [];
+  const visualLabel = isChoiceControl ? "" : getVisualFieldLabel(control);
   const candidates = [
-    ...(atsAdapters?.getLabelCandidates?.(control) || []),
     fromFor?.textContent,
     closestLabel?.textContent,
     fromAria,
     control.getAttribute("aria-label"),
+    visualLabel,
+    ...siblingLabels,
+    ...(atsAdapters?.getLabelCandidates?.(control) || []),
     ...choiceLabels,
     ...containerLabels,
-    ...siblingLabels,
     control.getAttribute("placeholder"),
     control.name,
     control.id
@@ -1295,6 +1316,15 @@ function getChoiceQuestionLabel(control) {
   return "";
 }
 
+function getCheckboxGroupQuestionLabel(control, checkboxGroup = []) {
+  const group = checkboxGroup.length > 0 ? checkboxGroup : [control];
+  const anchor = group[0] || control;
+  const anchorQuestion = getChoiceQuestionLabel(anchor);
+  if (anchorQuestion) return anchorQuestion;
+  if (anchor !== control) return getChoiceQuestionLabel(control);
+  return "";
+}
+
 function findQuestionLabelText(root, control) {
   if (!root || root === control || root.contains?.(control) && root.matches?.("label")) return "";
   const selectors = [
@@ -1366,6 +1396,7 @@ function getVisualQuestionLabel(control) {
   const selector = [
     "label",
     "legend",
+    "div",
     "p",
     "div",
     "span",
@@ -1393,6 +1424,52 @@ function getVisualQuestionLabel(control) {
         text,
         verticalDistance,
         score: verticalDistance - (isQuestionLikeText(text) ? 80 : 0)
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.score - right.score);
+
+  return candidates[0]?.text || "";
+}
+
+function getVisualFieldLabel(control) {
+  const controlRect = control?.getBoundingClientRect?.();
+  if (!controlRect || controlRect.width <= 0 || controlRect.height <= 0) return "";
+
+  const scope = control.closest?.("form, main, [role='main']") || document.body;
+  const candidates = Array.from(scope?.querySelectorAll?.([
+    "label",
+    "legend",
+    "p",
+    "span",
+    "strong",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "[class*='label' i]",
+    "[data-testid*='label' i]"
+  ].join(",")) || [])
+    .map((element) => {
+      if (!isVisible(element) || element === control || element.contains(control)) return null;
+      if (element.querySelector?.("input, textarea, select, button, [role='button'], [role='radio'], [role='combobox']")) return null;
+      const text = cleanLabel(element.textContent || element.getAttribute?.("aria-label") || "");
+      if (!text || text.length > 300) return null;
+
+      const rect = element.getBoundingClientRect?.();
+      if (!rect) return null;
+      const verticalDistance = controlRect.top - rect.bottom;
+      if (verticalDistance < -8 || verticalDistance > 180) return null;
+      if (rect.right < controlRect.left - 80 || rect.left > controlRect.right + 80) return null;
+
+      const labelLike = element.matches?.("label, legend, strong, [class*='label' i], [data-testid*='label' i]");
+      if (!labelLike && !isQuestionLikeText(text)) return null;
+      const horizontalDistance = Math.abs(rect.left - controlRect.left);
+      return {
+        text,
+        score: verticalDistance + Math.min(horizontalDistance, 120) * 0.15 - (isQuestionLikeText(text) ? 80 : 0)
       };
     })
     .filter(Boolean)
@@ -1622,6 +1699,23 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
         source: answer.source || "",
         attempts: previousAttempts,
         max_attempts: MAX_FIELD_FILL_ATTEMPTS
+      });
+      missed += 1;
+      missedIds.add(requestedFieldId);
+      continue;
+    }
+
+    if (isSuspiciousNarrativeBooleanAnswer(answer, field, controls)) {
+      const attempt = recordGeneratedAnswerFillFailure(attemptKey);
+      traceAutoBid("answer:rejected-narrative-boolean", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
+        question: field.question || field.label || "",
+        answer: answer.value || "",
+        source: answer.source || "",
+        attempt,
+        max_attempts: MAX_FIELD_FILL_ATTEMPTS,
+        stopped: attempt >= MAX_FIELD_FILL_ATTEMPTS
       });
       missed += 1;
       missedIds.add(requestedFieldId);
@@ -4101,6 +4195,24 @@ function parseBooleanAnswer(value) {
   return null;
 }
 
+function isSuspiciousNarrativeBooleanAnswer(answer, field, controls = []) {
+  if (parseBooleanAnswer(answer?.value ?? answer?.answer ?? "") === null) return false;
+  const first = controls?.[0];
+  const type = first ? getControlType(first) : field?.type;
+  if (!["text", "search", "textarea", "contenteditable"].includes(type)) return false;
+
+  const visibleQuestion = first ? getVisualFieldLabel(first) : "";
+  const question = cleanLabel(visibleQuestion || field?.question || field?.label || answer?.question || "");
+  return !isSemanticBooleanQuestion(question);
+}
+
+function isSemanticBooleanQuestion(question) {
+  const text = normalize(question);
+  if (!text) return false;
+  return /^(?:do|does|did|are|is|was|were|have|has|had|can|could|will|would|should|may|must)\b/.test(text) ||
+    /\b(?:yes\s*(?:or|\/)\s*no|confirm whether|please confirm (?:that|whether|if)|eligible to|authorized to|authorised to|willing to|open to|able to)\b/.test(text);
+}
+
 function generatedAnswerValuesMatch(currentValue, expectedValue) {
   const current = normalize(currentValue);
   const expected = normalize(expectedValue);
@@ -4309,7 +4421,12 @@ function findSheetValueByAlias(values, aliases) {
 
 function serializeSheetQuestionField(field) {
   const controls = getControlsByFieldId(field.id);
-  const question = getPlainQuestionText(field.question || field.label);
+  const first = controls[0];
+  const type = first ? getControlType(first) : field.type;
+  const visibleQuestion = !["checkbox", "radio", "button-group"].includes(type) && first
+    ? getVisualFieldLabel(first)
+    : "";
+  const question = getPlainQuestionText(visibleQuestion || field.question || field.label);
   const option = getPlainQuestionText(field.option || getChoiceOptionTextFromControls(field, controls));
   return {
     field_id: field.id,

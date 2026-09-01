@@ -170,7 +170,7 @@
     }),
     adapter("recruitee", "Recruitee", [/(^|\.)recruitee\.com$/i], {
       markers: ["[data-testid*='application-form']", ".application-form"],
-      containers: ["[data-testid*='field']", ".form-field", ".question", "fieldset"],
+      containers: ["[data-testid*='field']", ".form-field", "[class*='form-field' i]", "[class*='open-question' i]", "fieldset"],
       labels: ["[data-testid*='label']", ".form-label", "legend"],
       options: ["[data-testid*='option']", "[role='option']"]
     }),
