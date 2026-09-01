@@ -40,6 +40,8 @@ const DROPDOWN_SELECT_TIMEOUT_MS = 2200;
 const DROPDOWN_SETTLE_MS = 450;
 const LOCATION_AUTOCOMPLETE_WAIT_MS = 2000;
 const MAX_FIELD_FILL_ATTEMPTS = 3;
+const MAX_COLLECTED_CHOICE_OPTIONS = 200;
+const VIRTUALIZED_CHOICE_SCROLL_STEPS = 24;
 const SHEET_ANSWER_FIRST_WAIT_MS = 10000;
 const SHEET_ANSWER_RETRY_ATTEMPTS = 3;
 const SHEET_ANSWER_RETRY_MS = 10000;
@@ -156,6 +158,7 @@ const runtimeGptAnswersByRequest = new Map();
 const runtimeGptApplyPromises = new Map();
 const finalizedRuntimeGptRequestIds = new Set();
 const generatedAnswerFillAttempts = new Map();
+const failedStaticChoiceFieldKeys = new Set();
 const completedOutlookVerificationMessages = new Set();
 const atsAdapters = window.AutoBidAtsAdapters?.create({
   queryAll,
@@ -214,6 +217,7 @@ runAutoBid();
 async function runAutoBid() {
   if (!isActiveContentInstance() || autoBidRunning) return;
   autoBidRunning = true;
+  failedStaticChoiceFieldKeys.clear();
   lastNativeClickError = null;
   resetTrace();
   send("AUTOBID_AUTOFILL_STATE", { running: true, run_id: autoBidRunId, url: location.href }).catch(() => {});
@@ -227,6 +231,7 @@ async function runAutoBid() {
   await closeOpenChoiceMenus();
 
   let fields = collectFields();
+  auditRequiredFieldStates("initial", fields);
   traceAutoBid("fields:collected", {
     count: fields.length,
     fields: fields.map((field) => ({
@@ -329,12 +334,14 @@ async function runAutoBid() {
       ),
       emptyFillResult()
     );
+    fields = collectFields();
+    const finalRequiredAudit = auditRequiredFieldStates("final", fields);
     const submitResult = await maybeAutoSubmitApplication(fields, {
       filled: runtimeGptResult.filled + openAiResult.filled + finalDefaultResult.filled,
       pending: runtimeGptResult.pending
     }, resumeResult);
     const filled = staticFallbackResult.filled + localFallbackResult.filled + runtimeGptResult.filled + openAiResult.filled + profileReconcileResult.filled + runtimeGptReconcileResult.filled + finalDefaultResult.filled + resumeResult.filled;
-    const missed = getMissingRequiredFields(collectFields()).length;
+    const missed = finalRequiredAudit.missing.length;
     traceAutoBid("run:complete", { filled, missed, runtime_gpt: runtimeGptResult, openai: openAiResult, profile_reconcile: profileReconcileResult, runtime_gpt_reconcile: runtimeGptReconcileResult, final_defaults: finalDefaultResult, resume: resumeResult, submit: submitResult });
     showStatus(
       submitResult.clicked ? "Application submitted" : missed > 0 ? "Autofill finished" : "Autofill done",
@@ -815,6 +822,7 @@ function collectFields() {
   const fields = [];
   const radioGroups = new Map();
   const checkboxGroups = new Map();
+  const canonicalControls = new Set();
 
   controls.forEach((control) => {
     if (getControlType(control) !== "checkbox") return;
@@ -832,6 +840,17 @@ function collectFields() {
       radioGroups.get(key).push(control);
       return;
     }
+
+    const canonicalControl = getCanonicalFieldControl(control);
+    if (canonicalControls.has(canonicalControl)) {
+      traceAutoBid("fields:duplicate-control-skipped", {
+        type,
+        label: getFieldLabel(control),
+        canonical_tag: canonicalControl?.tagName || ""
+      });
+      return;
+    }
+    canonicalControls.add(canonicalControl);
 
     const label = getFieldLabel(control);
     const id = `ab_${index}_${hashSmall([
@@ -1258,6 +1277,27 @@ function isCompositeComboboxShell(control) {
     Boolean(control.querySelector("input[role='combobox'], input[aria-autocomplete='list']"));
 }
 
+function getCanonicalFieldControl(control) {
+  if (!control) return control;
+  const type = getControlType(control);
+
+  if (type === "checkbox") {
+    return getCheckboxInput(control) || control;
+  }
+
+  if (type === "radio") {
+    return control.matches?.("input[type='radio']")
+      ? control
+      : control.querySelector?.("input[type='radio']") || control;
+  }
+
+  if (type === "combobox") {
+    return getComboboxShell(control) || getComboboxInput(control) || control;
+  }
+
+  return control;
+}
+
 function getControlOptions(control) {
   if (control.tagName === "SELECT") {
     return Array.from(control.options)
@@ -1365,6 +1405,7 @@ function getFieldLabel(control) {
     ...(atsAdapters?.getLabelCandidates?.(control) || []),
     ...choiceLabels,
     ...containerLabels,
+    getDescribedByText(control),
     control.getAttribute("placeholder"),
     control.name,
     control.id
@@ -1704,10 +1745,7 @@ function getSelectedChoiceButtonLabel(buttons) {
 
 function isChoiceButtonSelected(button) {
   if (!button) return false;
-  if (button.getAttribute("aria-pressed") === "true" || button.getAttribute("aria-checked") === "true") return true;
-  if (button.getAttribute("data-selected") === "true" || button.getAttribute("data-state") === "checked") return true;
-  if (button.matches("[aria-selected='true'], .selected, .active, [class*='selected' i], [class*='active' i]")) return true;
-  return false;
+  return getExplicitChoiceSelectionState(button) === true;
 }
 
 function getRadioOptionLabel(control) {
@@ -1727,9 +1765,48 @@ function getRadioOptionLabel(control) {
 function isRadioChecked(control) {
   if (!control) return false;
   if (control.matches?.("input[type='radio']")) return Boolean(control.checked);
-  if (control.getAttribute?.("aria-checked") === "true") return true;
-  if (["checked", "selected", "on"].includes(control.getAttribute?.("data-state"))) return true;
-  return Boolean(control.matches?.("[aria-selected='true'], .checked, .selected, .active, [class*='checked' i], [class*='selected' i], [class*='active' i]"));
+  return getExplicitChoiceSelectionState(control) === true;
+}
+
+function getExplicitChoiceSelectionState(control) {
+  if (!control) return null;
+  if (control.matches?.("input[type='checkbox'], input[type='radio']")) return Boolean(control.checked);
+
+  for (const attribute of ["aria-checked", "aria-pressed", "aria-selected", "data-automation-selected", "data-selected", "data-checked"]) {
+    const value = normalize(control.getAttribute?.(attribute) || "");
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+
+  const state = normalize(control.getAttribute?.("data-state") || "");
+  if (["checked", "selected", "active", "on"].includes(state)) return true;
+  if (["unchecked", "unselected", "inactive", "off"].includes(state)) return false;
+  if (hasSelectedStateClass(control)) return true;
+  return null;
+}
+
+function hasSelectedStateClass(control) {
+  const className = String(control?.className || "");
+  if (!className) return false;
+  if (className.includes("_active_") || className.includes("_selected_") || className.includes("_checked_")) return true;
+  return className.split(/\s+/).some((token) =>
+    /^(?:active|selected|checked)$/i.test(token) ||
+    /(?:^|[-_])(?:active|selected|checked)(?:$|[-_])/i.test(token)
+  );
+}
+
+function hasSelectedChoiceDescendant(control) {
+  return queryAll([
+    "[aria-pressed='true']",
+    "[aria-checked='true']",
+    "[aria-selected='true']",
+    "[data-automation-selected='true']",
+    "[data-selected='true']",
+    "[data-checked='true']",
+    "[data-state='checked']",
+    "[data-state='selected']"
+  ].join(","), control).length > 0 ||
+    queryAll("[class]", control).some(hasSelectedStateClass);
 }
 
 function cleanLabel(text) {
@@ -2433,6 +2510,9 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
     const candidateValues = getProfileStaticCandidateValues(staticFields, key, field, controls);
     if (candidateValues.length === 0) {
       missing.push({ field_id: field.id, key, label: field.label });
+      if (field.required && isChoiceFieldType(field.type)) {
+        failedStaticChoiceFieldKeys.add(getStableFieldBindingKey(field));
+      }
       continue;
     }
 
@@ -2471,6 +2551,7 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
     }
 
     if (appliedValue) {
+      failedStaticChoiceFieldKeys.delete(getStableFieldBindingKey(field));
       filled += 1;
       filledLocalIds.add(field.id);
       traceAutoBid("profile-static:applied", {
@@ -2482,6 +2563,9 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
       });
       if (key === "country") await sleep(350);
     } else {
+      if (field.required && isChoiceFieldType(field.type)) {
+        failedStaticChoiceFieldKeys.add(getStableFieldBindingKey(field));
+      }
       missed += 1;
       traceAutoBid("profile-static:missed", {
         field_id: field.id,
@@ -4323,6 +4407,38 @@ function getMissingRequiredFields(fields) {
   });
 }
 
+function auditRequiredFieldStates(stage, fields = collectFields()) {
+  const required = (fields || []).filter((field) =>
+    field.required && !isGeneratedAnswerIgnoredFieldType(field.type)
+  );
+  const missing = [];
+  const complete = [];
+
+  for (const field of required) {
+    const controls = getControlsByFieldId(field.id);
+    const current = cleanLabel(getCurrentChoiceSummary(controls) || field.value || "");
+    const entry = {
+      field_id: field.id,
+      question: field.question || field.label || "",
+      option: field.option || "",
+      type: field.type,
+      options: field.options || [],
+      current
+    };
+    if (controls.length > 0 && hasFieldCurrentValue(field, controls)) complete.push(entry);
+    else missing.push(entry);
+  }
+
+  traceAutoBid("fields:required-audit", {
+    stage,
+    required: required.length,
+    complete: complete.length,
+    missing: missing.length,
+    missing_fields: missing
+  });
+  return { required, complete, missing };
+}
+
 function hasMissingRequiredResumeUpload(fields) {
   const collectedFileFieldMissing = (fields || []).some((field) =>
     field.required && field.type === "file" && isResumeUploadField(field) && !hasRequiredFileFieldValue(field)
@@ -4456,9 +4572,7 @@ async function hydrateGeneratedChoiceOptions(fields) {
     if (field.type === "combobox") {
       await clearComboboxSearchValue(control);
       const options = await getComboboxChoices(control);
-      discoveredOptions = options.map((option) => cleanLabel(
-        option.textContent || option.getAttribute("data-value") || option.getAttribute("value") || ""
-      ));
+      discoveredOptions = await collectAllComboboxOptionTexts(control, options);
       await closeCombobox(control);
     } else if (field.type === "radio") {
       discoveredOptions = controls.map(getRadioOptionLabel);
@@ -4482,6 +4596,77 @@ async function hydrateGeneratedChoiceOptions(fields) {
   }
 }
 
+async function collectAllComboboxOptionTexts(control, initialOptions = []) {
+  const values = new Set();
+  const collectVisible = (options = getVisibleChoiceElements(control)) => {
+    for (const option of options) {
+      const value = cleanLabel(
+        option.textContent || option.getAttribute?.("aria-label") || option.getAttribute?.("data-value") || option.getAttribute?.("value") || ""
+      );
+      if (!value || isGeneratedChoicePlaceholder(value, value)) continue;
+      values.add(value);
+      if (values.size >= MAX_COLLECTED_CHOICE_OPTIONS) break;
+    }
+  };
+
+  collectVisible(initialOptions);
+  const scrollContainers = getComboboxOptionScrollContainers(control);
+  for (const container of scrollContainers) {
+    if (values.size >= MAX_COLLECTED_CHOICE_OPTIONS) break;
+    const originalScrollTop = container.scrollTop;
+    let previousScrollTop = -1;
+
+    for (let step = 0; step < VIRTUALIZED_CHOICE_SCROLL_STEPS; step += 1) {
+      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      if (maxScrollTop <= 0 || container.scrollTop >= maxScrollTop || container.scrollTop === previousScrollTop) break;
+      previousScrollTop = container.scrollTop;
+      container.scrollTop = Math.min(maxScrollTop, container.scrollTop + Math.max(120, container.clientHeight * 0.8));
+      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sleep(70);
+      collectVisible();
+      if (values.size >= MAX_COLLECTED_CHOICE_OPTIONS) break;
+    }
+
+    container.scrollTop = originalScrollTop;
+    container.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await sleep(50);
+  }
+
+  traceAutoBid("ai:choice-options-scanned", {
+    field_id: control?.dataset?.autoBidFieldId || "",
+    options: values.size,
+    scroll_containers: scrollContainers.length,
+    capped: values.size >= MAX_COLLECTED_CHOICE_OPTIONS
+  });
+  return Array.from(values);
+}
+
+function getComboboxOptionScrollContainers(control) {
+  const roots = [
+    getOwnedListbox(control),
+    ...getComboboxRoots(control),
+    ...getOpenChoiceContainers(control)
+  ].filter((root) => root && root !== document && root !== document.body && root !== document.documentElement);
+  const selector = [
+    "[role='listbox']",
+    "[role='menu']",
+    ".select__menu-list",
+    ".fab-MenuList",
+    ".select2-results__options",
+    ".chosen-results",
+    "[class*='option-list' i]",
+    "[class*='menu-list' i]"
+  ].join(",");
+  const candidates = roots.flatMap((root) => [
+    root,
+    ...Array.from(root.querySelectorAll?.(selector) || [])
+  ]);
+
+  return Array.from(new Set(candidates))
+    .filter((element) => isVisible(element))
+    .filter((element) => element.scrollHeight > element.clientHeight + 8);
+}
+
 function hasCompleteGeneratedChoiceOptions(field) {
   if (!CHOICE_FIELD_TYPES.includes(field?.type)) return true;
   return Array.isArray(field.options) && field.options.some((option) => !isGeneratedChoicePlaceholder(option, option));
@@ -4492,7 +4677,9 @@ function getGeneratedAnswerCandidateSkipReason(field, filledIds) {
   if (isGeneratedAnswerIgnoredFieldType(field.type)) return "ignored-field-type";
   if (!field.required) return "not-required";
   if (isSensitiveGeneratedAnswerField(field)) return "sensitive-field";
-  if (isProfileStaticQuestionField(field)) return "profile-static-field";
+  if (isProfileStaticQuestionField(field) && !failedStaticChoiceFieldKeys.has(getStableFieldBindingKey(field))) {
+    return "profile-static-field";
+  }
   if (filledIds?.has?.(field.id)) return "already-resolved-locally";
 
   const controls = getControlsByFieldId(field.id);
@@ -6671,8 +6858,7 @@ function isCheckboxBooleanChoiceSelected(choice) {
 
   for (const node of stateNodes) {
     if (isChoiceButtonSelected(node)) return true;
-    const selectedDescendant = node.querySelector?.("[aria-pressed='true'], [aria-checked='true'], [aria-selected='true'], [data-selected='true'], [data-state='checked'], [data-state='selected'], .selected, .active, [class*='selected' i], [class*='active' i]");
-    if (selectedDescendant) return true;
+    if (hasSelectedChoiceDescendant(node)) return true;
     const radio = node.matches?.("input[type='radio']") ? node : node.querySelector?.("input[type='radio']");
     if (radio?.checked) return true;
   }
@@ -6729,9 +6915,7 @@ function isCheckboxChecked(control) {
   const input = getCheckboxInput(control);
   if (input) return Boolean(input.checked);
   if (control?.matches?.("input[type='checkbox']")) return Boolean(control.checked);
-  if (control?.getAttribute?.("aria-checked") === "true") return true;
-  if (control?.getAttribute?.("data-state") === "checked") return true;
-  return Boolean(control?.matches?.(".checked, .selected, .active, [class*='checked' i], [class*='selected' i], [class*='active' i]"));
+  return getExplicitChoiceSelectionState(control) === true;
 }
 
 async function setButtonGroupValue(controls, value, field = null) {
@@ -7491,8 +7675,30 @@ function getComboboxToggle(control) {
 
 function getComboboxSelectedText(control) {
   const shell = getComboboxShell(control);
-  const selected = shell?.querySelector(".select__single-value, [class*='single-value'], .fab-SelectToggle__content, .select2-selection__rendered, .select2-chosen, .chosen-single span, [aria-selected='true']");
-  return cleanLabel(selected?.textContent || "");
+  const multiValues = Array.from(shell?.querySelectorAll?.([
+    ".react-select__multi-value__label",
+    ".select__multi-value__label",
+    "[class*='multi-value__label']",
+    "[class*='multiValueLabel']"
+  ].join(",")) || [])
+    .map((element) => cleanLabel(element.textContent || element.getAttribute?.("aria-label") || ""))
+    .filter((value) => value && !isPlaceholderChoice(value, value));
+  if (multiValues.length > 0) return uniqueNonEmptyValues(multiValues).join(", ");
+
+  const candidates = Array.from(shell?.querySelectorAll?.([
+    ".select__single-value",
+    ".react-select__single-value",
+    "[class*='single-value']",
+    ".fab-SelectToggle__content",
+    ".select2-selection__rendered",
+    ".select2-chosen",
+    ".chosen-single span",
+    ".select__value-container--has-value",
+    "[aria-selected='true']"
+  ].join(",")) || []);
+  return candidates
+    .map((element) => cleanLabel(element.textContent || element.getAttribute?.("aria-label") || ""))
+    .find((value) => value && !isPlaceholderChoice(value, value)) || "";
 }
 
 function getComboboxValueText(control) {

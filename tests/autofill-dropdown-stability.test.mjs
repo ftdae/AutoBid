@@ -153,10 +153,64 @@ test("bare boolean answers cannot be written into non-boolean narrative fields",
 test("dynamic dropdown options are collected before an AI request", () => {
   assert.match(contentSource, /await hydrateGeneratedChoiceOptions\(candidateFields\)/);
   assert.match(contentSource, /ai:choice-options-hydrated/);
+  assert.match(contentSource, /collectAllComboboxOptionTexts\(control, options\)/);
+  assert.match(contentSource, /VIRTUALIZED_CHOICE_SCROLL_STEPS = 24/);
+  assert.match(contentSource, /container\.dispatchEvent\(new Event\("scroll", \{ bubbles: true \}\)\)/);
+  assert.match(contentSource, /MAX_COLLECTED_CHOICE_OPTIONS = 200/);
   assert.match(contentSource, /field\.options = uniqueNonEmptyValues/);
   assert.match(contentSource, /function hasCompleteGeneratedChoiceOptions/);
   assert.match(contentSource, /runtime-gpt:choice-options-unavailable/);
   assert.match(contentSource, /const requestableFields = unresolvedCandidateFields\.filter\(\(field\) => hasCompleteGeneratedChoiceOptions\(field\)\)/);
+});
+
+test("composite controls are canonicalized before questions are sent to GPT", () => {
+  const collectSource = contentSource.slice(
+    contentSource.indexOf("function collectFields"),
+    contentSource.indexOf("function getFormControls")
+  );
+  assert.match(collectSource, /const canonicalControls = new Set\(\)/);
+  assert.match(collectSource, /getCanonicalFieldControl\(control\)/);
+  assert.match(collectSource, /fields:duplicate-control-skipped/);
+  assert.match(contentSource, /return getComboboxShell\(control\) \|\| getComboboxInput\(control\) \|\| control/);
+});
+
+test("required static choice failures are promoted to GPT with their live options", () => {
+  assert.match(contentSource, /const failedStaticChoiceFieldKeys = new Set\(\)/);
+  assert.match(contentSource, /failedStaticChoiceFieldKeys\.clear\(\)/);
+  assert.match(contentSource, /failedStaticChoiceFieldKeys\.add\(getStableFieldBindingKey\(field\)\)/);
+  assert.match(contentSource, /isProfileStaticQuestionField\(field\) && !failedStaticChoiceFieldKeys\.has\(getStableFieldBindingKey\(field\)\)/);
+  assert.match(contentSource, /await hydrateGeneratedChoiceOptions\(candidateFields\)/);
+});
+
+test("framework choice state and multi-select values are verified from rendered UI", () => {
+  const stateSource = contentSource.slice(
+    contentSource.indexOf("function getExplicitChoiceSelectionState"),
+    contentSource.indexOf("function cleanLabel")
+  );
+  assert.match(stateSource, /data-automation-selected/);
+  assert.match(stateSource, /aria-pressed/);
+  assert.match(stateSource, /hasSelectedStateClass/);
+  assert.doesNotMatch(stateSource, /\[class\*='active'/);
+
+  const selectedTextSource = contentSource.slice(
+    contentSource.indexOf("function getComboboxSelectedText"),
+    contentSource.indexOf("function getComboboxValueText")
+  );
+  assert.match(selectedTextSource, /react-select__multi-value__label/);
+  assert.match(selectedTextSource, /uniqueNonEmptyValues\(multiValues\)\.join\(", "\)/);
+  assert.match(selectedTextSource, /select__value-container--has-value/);
+});
+
+test("the final required-field audit is read-only and reports newly rendered gaps", () => {
+  const auditSource = contentSource.slice(
+    contentSource.indexOf("function auditRequiredFieldStates"),
+    contentSource.indexOf("function hasMissingRequiredResumeUpload")
+  );
+  assert.match(contentSource, /auditRequiredFieldStates\("initial", fields\)/);
+  assert.match(contentSource, /const finalRequiredAudit = auditRequiredFieldStates\("final", fields\)/);
+  assert.match(auditSource, /fields:required-audit/);
+  assert.match(auditSource, /missing_fields: missing/);
+  assert.doesNotMatch(auditSource, /setControlsValue|applyAnswers|click\(/);
 });
 
 test("a native click is verified and falls back to the page bridge before keyboard opening", () => {
