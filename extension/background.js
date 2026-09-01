@@ -9,7 +9,6 @@ const DEV_USER = {
   name: "Dev User",
   timezone: "UTC"
 };
-const NATIVE_DEBUGGER_IDLE_MS = 5000;
 const AUTO_BID_TRIGGER_DEDUP_MS = 1500;
 const AUTO_BID_WINDOW_STORAGE_KEY = "autoBidWindowId";
 const EXECUTION_LOG_STORAGE_KEY = "autoBidExecutionLogsV1";
@@ -20,21 +19,19 @@ const GPT_BATCH_STATES_STORAGE_KEY = "autoBidGptBatchStatesV2";
 const GPT_BATCH_PAUSED_STORAGE_KEY = "autoBidGptBatchPaused";
 const RUNTIME_GPT_QUEUE_STORAGE_KEY = "autoBidRuntimeGptQueueV2";
 const GPT_WORKER_URL = "https://chatgpt.com/?autobid_worker=1";
-// Keep application contexts isolated: one application per prompt, with five
-// persistent workers running in parallel. The durable queue itself is unlimited.
+// Keep one application per prompt, with three persistent workers running in
+// parallel. The durable request queue itself is unlimited.
 const RUNTIME_GPT_PROMPT_BATCH_SIZE = 1;
-const RUNTIME_GPT_MAX_WORKERS = 5;
+const RUNTIME_GPT_MAX_WORKERS = 3;
 const RUNTIME_GPT_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const RUNTIME_GPT_LEASE_MS = 5 * 60 * 1000;
 const RUNTIME_GPT_RETRY_DELAY_MS = 5000;
-const BACKGROUND_AUTOMATION_RELEASE_DELAY_MS = 750;
 const RUNTIME_GPT_DELIVERY_ATTEMPTS = 3;
 const RUNTIME_GPT_DELIVERY_RETRY_MS = 1000;
 const RUNTIME_GPT_DELIVERY_ALARM_PREFIX = "autobid-gpt-delivery:";
 const AUTO_BID_WINDOW_SIZE = { width: 500, height: 760 };
 const AUTO_BID_WINDOW_EDGE_GAP = 24;
 const nativeInputQueues = new Map();
-const nativeDebuggerSessions = new Map();
 const backgroundAutomationHolds = new Map();
 const runtimeGptDeliveryPromises = new Map();
 const autoBidTriggerTimes = new Map();
@@ -48,19 +45,20 @@ let runtimeGptPersistPromise = Promise.resolve();
 let nextRuntimeGptQueueSequence = 1;
 let executionLogWritePromise = Promise.resolve();
 
-chrome.debugger?.onDetach?.addListener((source) => {
-  const tabId = source?.tabId;
-  if (!Number.isInteger(tabId)) return;
-  const session = nativeDebuggerSessions.get(tabId);
-  if (session?.detachTimer) clearTimeout(session.detachTimer);
-  nativeDebuggerSessions.delete(tabId);
-});
-
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await chrome.storage.local.get(["apiBase"]);
   if (!settings.apiBase) {
     await chrome.storage.local.set({ apiBase: DEFAULT_API_BASE });
   }
+  await enforceRuntimeGptWorkerLimit().catch((error) => {
+    console.warn("[AutoBid GPT Pool] Could not trim legacy worker tabs after reload", error);
+  });
+});
+
+chrome.runtime.onStartup?.addListener(() => {
+  enforceRuntimeGptWorkerLimit().catch((error) => {
+    console.warn("[AutoBid GPT Pool] Could not trim legacy worker tabs at startup", error);
+  });
 });
 
 chrome.commands.onCommand.addListener((command) => {
@@ -187,9 +185,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   backgroundAutomationHolds.delete(tabId);
-  const session = nativeDebuggerSessions.get(tabId);
-  if (session?.detachTimer) clearTimeout(session.detachTimer);
-  nativeDebuggerSessions.delete(tabId);
   handleRuntimeGptBatchTabRemoved(tabId).catch((error) => {
     console.warn("[AutoBid Batch] Could not recover a closed ChatGPT batch tab", error);
   });
@@ -594,375 +589,74 @@ async function dispatchNativeClick(tabId, payload) {
   const x = Number(payload.x);
   const y = Number(payload.y);
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
-    throw new Error("Invalid native click coordinates");
+    throw new Error("Invalid page click coordinates");
   }
-
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const target = await acquireNativeDebugger(tabId);
-    try {
-      await sendNativeMouseClick(target, x, y);
-      scheduleNativeDebuggerDetach(tabId);
-      return { clicked: true };
-    } catch (error) {
-      await detachNativeDebugger(tabId);
-      const message = error?.message || String(error);
-      if (attempt === 1 && isDetachedNativeDebuggerError(message)) continue;
-      if (/another debugger|already attached|cannot attach/i.test(message)) {
-        throw new Error("Auto Bid could not control the dropdown. Close DevTools for this tab and try again.");
-      }
-      throw new Error(`Native dropdown click failed: ${message}`);
-    }
-  }
-
-  throw new Error("Native dropdown click failed after reconnecting the browser input session.");
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: clickPagePoint,
+    args: [{ x, y }]
+  });
+  if (!execution?.result?.clicked) throw new Error(execution?.result?.reason || "Page click did not reach a control");
+  return execution.result;
 }
 
-async function sendNativeMouseClick(target, x, y) {
-  await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x,
-    y,
-    button: "none",
-    buttons: 0
-  });
-  await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-    type: "mousePressed",
-    x,
-    y,
-    button: "left",
-    buttons: 1,
-    clickCount: 1
-  });
-  await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-    type: "mouseReleased",
-    x,
-    y,
-    button: "left",
-    buttons: 0,
-    clickCount: 1
-  });
+function clickPagePoint(payload) {
+  const target = document.elementFromPoint(Number(payload.x), Number(payload.y));
+  const control = target?.closest?.("button, [role='button'], [role='option'], [role='radio'], [role='checkbox'], input, label, a") || target;
+  if (!control) return { clicked: false, reason: "No control was found at the requested position" };
+  control.focus?.({ preventScroll: true });
+  control.click?.();
+  return { clicked: true, method: "page-click" };
 }
 
 async function dispatchNativeType(tabId, payload) {
   const text = String(payload.text || "").slice(0, 200);
-  if (!text) throw new Error("Native typing requires text");
-
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const target = await acquireNativeDebugger(tabId);
-    try {
-      await sendNativeText(target, text, payload.commit !== false);
-      scheduleNativeDebuggerDetach(tabId);
-      return { typed: true };
-    } catch (error) {
-      await detachNativeDebugger(tabId);
-      const message = error?.message || String(error);
-      if (attempt === 1 && isDetachedNativeDebuggerError(message)) continue;
-      if (/another debugger|already attached|cannot attach/i.test(message)) {
-        throw new Error("Auto Bid could not type into the field. Close DevTools for this tab and try again.");
-      }
-      throw new Error(`Native typing failed: ${message}`);
-    }
-  }
-
-  throw new Error("Native typing failed after reconnecting the browser input session.");
+  if (!text) throw new Error("Page typing requires text");
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: typeIntoFocusedPageControl,
+    args: [{ text, commit: payload.commit !== false }]
+  });
+  if (!execution?.result?.typed) throw new Error(execution?.result?.reason || "Page typing did not reach a field");
+  return execution.result;
 }
 
-async function sendNativeText(target, text, commit) {
-  await dispatchNativeKey(target, "keyDown", "a", "KeyA", 65, 2);
-  await dispatchNativeKey(target, "keyUp", "a", "KeyA", 65, 2);
-  await dispatchNativeKey(target, "keyDown", "Backspace", "Backspace", 8);
-  await dispatchNativeKey(target, "keyUp", "Backspace", "Backspace", 8);
-  await chrome.debugger.sendCommand(target, "Input.insertText", { text });
-  if (commit) {
-    await dispatchNativeKey(target, "keyDown", "Enter", "Enter", 13);
-    await dispatchNativeKey(target, "keyUp", "Enter", "Enter", 13);
+function typeIntoFocusedPageControl(payload) {
+  let control = document.activeElement;
+  while (control?.shadowRoot?.activeElement) control = control.shadowRoot.activeElement;
+  if (!control || !control.matches?.("input, textarea, [contenteditable='true'], [role='combobox']")) {
+    return { typed: false, reason: "No editable control is focused" };
   }
-}
 
-function isDetachedNativeDebuggerError(message) {
-  return /not attached|detached|target closed|session.*closed/i.test(String(message || ""));
+  const text = String(payload.text || "");
+  if (control.matches("input, textarea")) {
+    const setter = Object.getOwnPropertyDescriptor(control.constructor.prototype, "value")?.set;
+    if (setter) setter.call(control, text);
+    else control.value = text;
+  } else {
+    control.textContent = text;
+  }
+  control.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text }));
+  if (payload.commit) {
+    control.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key: "Enter", code: "Enter" }));
+    control.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key: "Enter", code: "Enter" }));
+    control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  }
+  return { typed: true, method: "page-input" };
 }
 
 function nativeFileUpload(sender, payload) {
-  const tabId = sender?.tab?.id;
-  if (!Number.isInteger(tabId)) throw new Error("Native file upload requires an active browser tab");
-  if ((sender.frameId || 0) !== 0) throw new Error("Native file upload is currently supported in the top page only");
-
-  const token = String(payload.token || "");
-  if (!token) throw new Error("Native file upload requires a target token");
-  normalizeNativeFilePayload(payload);
-
-  return queueNativeInput(tabId, () => dispatchNativeFileUpload(tabId, payload));
-}
-
-async function dispatchNativeFileUpload(tabId, payload, reconnectAttempt = 0) {
-  const token = String(payload.token || "");
-  const filePayload = normalizeNativeFilePayload(payload);
-
-  const target = await acquireNativeDebugger(tabId);
-  let objectId = "";
-  try {
-    await chrome.debugger.sendCommand(target, "DOM.enable").catch(() => {});
-    const selector = `[data-auto-bid-native-file-token="${cssStringEscape(token)}"]`;
-    const evaluated = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(() => {
-        const selector = ${JSON.stringify(selector)};
-        const stack = [document];
-        const seen = new Set();
-        while (stack.length) {
-          const current = stack.shift();
-          if (!current || seen.has(current)) continue;
-          seen.add(current);
-          if (current.matches?.(selector)) return current;
-          const match = current.querySelector?.(selector);
-          if (match) return match;
-          current.querySelectorAll?.("*").forEach((element) => {
-            if (element.shadowRoot) stack.push(element.shadowRoot);
-          });
-        }
-        return null;
-      })()`,
-      objectGroup: "auto-bid-file-upload",
-      includeCommandLineAPI: false,
-      returnByValue: false
-    });
-    objectId = evaluated?.result?.objectId || "";
-    if (!objectId) throw new Error("File input was not found on the page");
-
-    const files = await setDebuggerFileInputFromBytes(target, objectId, filePayload);
-
-    await releaseDebuggerObject(target, objectId);
-    objectId = "";
-    scheduleNativeDebuggerDetach(tabId);
-    return {
-      uploaded: true,
-      files,
-      transport: "bytes"
-    };
-  } catch (error) {
-    if (objectId) await releaseDebuggerObject(target, objectId);
-    await detachNativeDebugger(tabId);
-    const message = error?.message || String(error);
-    if (reconnectAttempt < 1 && isDetachedNativeDebuggerError(message)) {
-      return dispatchNativeFileUpload(tabId, payload, reconnectAttempt + 1);
-    }
-    if (/another debugger|already attached|cannot attach/i.test(message)) {
-      throw new Error("Auto Bid could not upload the file. Close DevTools for this tab and try again.");
-    }
-    throw new Error(`Native file upload failed: ${message}`);
-  }
+  void sender;
+  void payload;
+  throw new Error("Debugger-free mode uses the page file-input bridge instead");
 }
 
 function nativeFileChooserUpload(sender, payload) {
-  const tabId = sender?.tab?.id;
-  if (!Number.isInteger(tabId)) throw new Error("Native file chooser upload requires an active browser tab");
-  if ((sender.frameId || 0) !== 0) throw new Error("Native file chooser upload is currently supported in the top page only");
-
-  return queueNativeInput(tabId, () => dispatchNativeFileChooserUpload(tabId, payload || {}));
-}
-
-async function dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt = 0) {
-  const x = Number(payload.x);
-  const y = Number(payload.y);
-  const filePayload = normalizeNativeFilePayload(payload);
-  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
-    throw new Error("Invalid native file chooser click coordinates");
-  }
-
-  const target = await acquireNativeDebugger(tabId);
-  let objectId = "";
-  try {
-    await chrome.debugger.sendCommand(target, "Page.enable").catch(() => {});
-    await chrome.debugger.sendCommand(target, "DOM.enable").catch(() => {});
-    await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
-
-    const chooserPromise = waitForFileChooserOpened(tabId, 6000);
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x,
-      y,
-      button: "none",
-      buttons: 0
-    });
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x,
-      y,
-      button: "left",
-      buttons: 1,
-      clickCount: 1
-    });
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x,
-      y,
-      button: "left",
-      buttons: 0,
-      clickCount: 1
-    });
-
-    const chooser = await chooserPromise;
-    if (!chooser?.backendNodeId) throw new Error("File chooser opened without an input node");
-
-    const resolved = await chrome.debugger.sendCommand(target, "DOM.resolveNode", {
-      backendNodeId: chooser.backendNodeId,
-      objectGroup: "auto-bid-file-chooser-upload"
-    }).catch(() => null);
-    objectId = resolved?.object?.objectId || "";
-
-    if (!objectId) throw new Error("File chooser input could not be resolved");
-    const files = await setDebuggerFileInputFromBytes(target, objectId, filePayload);
-
-    if (objectId) {
-      await releaseDebuggerObject(target, objectId);
-      objectId = "";
-    }
-    await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
-    scheduleNativeDebuggerDetach(tabId);
-    return {
-      uploaded: true,
-      files,
-      mode: chooser.mode || "",
-      transport: "bytes"
-    };
-  } catch (error) {
-    if (objectId) await releaseDebuggerObject(target, objectId);
-    await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
-    await detachNativeDebugger(tabId);
-    const message = error?.message || String(error);
-    if (reconnectAttempt < 1 && isDetachedNativeDebuggerError(message)) {
-      return dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt + 1);
-    }
-    if (/another debugger|already attached|cannot attach/i.test(message)) {
-      throw new Error("Auto Bid could not upload the file. Close DevTools for this tab and try again.");
-    }
-    throw new Error(`Native file chooser upload failed: ${message}`);
-  }
-}
-
-function normalizeNativeFilePayload(payload = {}) {
-  const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "").trim();
-  if (!base64) throw new Error("Native file upload requires file bytes");
-  if (base64.length > 20 * 1024 * 1024) throw new Error("Native file upload is limited to 15 MB");
-
-  return {
-    base64,
-    filename: String(payload.filename || payload.name || "resume.pdf")
-      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
-      .trim() || "resume.pdf",
-    mimeType: String(payload.mime_type || payload.mimeType || "application/pdf").trim() || "application/pdf"
-  };
-}
-
-async function setDebuggerFileInputFromBytes(target, objectId, filePayload) {
-  const callResult = await chrome.debugger.sendCommand(target, "Runtime.callFunctionOn", {
-    objectId,
-    functionDeclaration: `function(base64, filename, mimeType) {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
-      const file = new File([bytes], filename, { type: mimeType });
-      const owner = this.closest?.("[data-controller~='forms--inputs--upload'], .dropzone, [class*='dropzone' i]") || this;
-      const signature = [filename, bytes.length, mimeType, base64.length, base64.slice(0, 24), base64.slice(-24)].join("|");
-      let hash = 2166136261;
-      for (let index = 0; index < signature.length; index += 1) {
-        hash ^= signature.charCodeAt(index);
-        hash = Math.imul(hash, 16777619);
-      }
-      const uploadKey = "abf_" + (hash >>> 0).toString(36);
-      if (owner.getAttribute("data-auto-bid-file-upload-key") === uploadKey) {
-        return { files: this.files ? this.files.length : 0, filename: this.files?.[0]?.name || "", duplicateSuppressed: true };
-      }
-      const transfer = new DataTransfer();
-      transfer.items.add(file);
-      this.files = transfer.files;
-      owner.setAttribute("data-auto-bid-file-upload-key", uploadKey);
-      owner.setAttribute("data-auto-bid-file-upload-state", "dispatched");
-      const managedDropzone = this.matches?.(".dz-hidden-input") || owner !== this;
-      if (!managedDropzone) this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      this.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      return { files: this.files ? this.files.length : 0, filename: this.files?.[0]?.name || "" };
-    }`,
-    arguments: [
-      { value: filePayload.base64 },
-      { value: filePayload.filename },
-      { value: filePayload.mimeType }
-    ],
-    returnByValue: true
-  });
-
-  if (callResult?.exceptionDetails) {
-    throw new Error(callResult.exceptionDetails.text || "The page rejected the resume file bytes");
-  }
-  const files = Number(callResult?.result?.value?.files || 0);
-  if (files < 1) throw new Error("The page did not accept the resume file bytes");
-  return files;
-}
-
-function waitForFileChooserOpened(tabId, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("File chooser did not open after clicking Attach"));
-    }, timeoutMs);
-
-    const listener = (source, method, params) => {
-      if (source?.tabId !== tabId || method !== "Page.fileChooserOpened") return;
-      cleanup();
-      resolve(params || {});
-    };
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      chrome.debugger.onEvent.removeListener(listener);
-    };
-
-    chrome.debugger.onEvent.addListener(listener);
-  });
-}
-
-function dispatchNativeKey(target, type, key, code, windowsVirtualKeyCode, modifiers = 0) {
-  return chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
-    type,
-    key,
-    code,
-    windowsVirtualKeyCode,
-    nativeVirtualKeyCode: windowsVirtualKeyCode,
-    modifiers
-  });
-}
-
-function releaseDebuggerObject(target, objectId) {
-  return chrome.debugger.sendCommand(target, "Runtime.releaseObject", { objectId }).catch(() => {});
-}
-
-function cssStringEscape(value) {
-  return String(value || "").replace(/["\\]/g, "\\$&");
-}
-
-async function acquireNativeDebugger(tabId) {
-  const existing = nativeDebuggerSessions.get(tabId);
-  if (existing?.attached) {
-    scheduleNativeDebuggerDetach(tabId);
-    return existing.target;
-  }
-
-  const target = { tabId };
-  try {
-    await chrome.debugger.attach(target, "1.3");
-  } catch (error) {
-    const message = error?.message || String(error);
-    if (/another debugger|already attached|cannot attach/i.test(message)) {
-      throw new Error("Auto Bid could not control the dropdown. Close DevTools for this tab and try again.");
-    }
-    throw new Error(`Native dropdown click failed: ${message}`);
-  }
-
-  nativeDebuggerSessions.set(tabId, { target, attached: true, detachTimer: null });
-  scheduleNativeDebuggerDetach(tabId);
-  return target;
+  void sender;
+  void payload;
+  throw new Error("Debugger-free mode cannot intercept a browser file chooser");
 }
 
 async function holdBackgroundTabAutomation(tabId, reason) {
@@ -973,30 +667,13 @@ async function holdBackgroundTabAutomation(tabId, reason) {
   backgroundAutomationHolds.set(tabId, reasons);
 
   await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => null);
-  const target = await acquireNativeDebugger(tabId);
-  const session = nativeDebuggerSessions.get(tabId);
-  if (session?.detachTimer) {
-    clearTimeout(session.detachTimer);
-    session.detachTimer = null;
-  }
-
-  const commands = [
-    ["Page.enable"],
-    ["Page.setWebLifecycleState", { state: "active" }],
-    ["Emulation.setFocusEmulationEnabled", { enabled: true }],
-    ["Emulation.setIdleOverride", { isUserActive: true, isScreenUnlocked: true }]
-  ];
-  const results = await Promise.allSettled(commands.map(([method, params]) => (
-    chrome.debugger.sendCommand(target, method, params)
-  )));
-  const enabled = results.filter((result) => result.status === "fulfilled").length;
-  console.info("[AutoBid Background] tab lifecycle hold enabled", {
+  console.info("[AutoBid Background] debugger-free tab protection enabled", {
     tab_id: tabId,
     reason: holdReason,
     holds: reasons.size,
-    commands_enabled: enabled
+    auto_discardable: false
   });
-  return { held: true, tabId, reason: holdReason, commandsEnabled: enabled };
+  return { held: true, tabId, reason: holdReason, debuggerFree: true };
 }
 
 async function releaseBackgroundTabAutomation(tabId, reason) {
@@ -1013,42 +690,8 @@ async function releaseBackgroundTabAutomation(tabId, reason) {
   if (releasedReason !== "gpt-worker") {
     await chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => null);
   }
-  const session = nativeDebuggerSessions.get(tabId);
-  if (session?.attached) {
-    await chrome.debugger.sendCommand(
-      session.target,
-      "Emulation.setFocusEmulationEnabled",
-      { enabled: false }
-    ).catch(() => {});
-    scheduleNativeDebuggerDetach(tabId, BACKGROUND_AUTOMATION_RELEASE_DELAY_MS);
-  }
-  console.info("[AutoBid Background] tab lifecycle hold released", { tab_id: tabId });
+  console.info("[AutoBid Background] debugger-free tab protection released", { tab_id: tabId });
   return { released: true, remaining: 0 };
-}
-
-function hasBackgroundAutomationHold(tabId) {
-  return (backgroundAutomationHolds.get(tabId)?.size || 0) > 0;
-}
-
-function scheduleNativeDebuggerDetach(tabId, delayMs = NATIVE_DEBUGGER_IDLE_MS) {
-  const session = nativeDebuggerSessions.get(tabId);
-  if (!session) return;
-  if (session.detachTimer) clearTimeout(session.detachTimer);
-  if (hasBackgroundAutomationHold(tabId)) {
-    session.detachTimer = null;
-    return;
-  }
-  session.detachTimer = setTimeout(() => {
-    detachNativeDebugger(tabId).catch(() => {});
-  }, Math.max(0, Number(delayMs || 0)));
-}
-
-async function detachNativeDebugger(tabId) {
-  const session = nativeDebuggerSessions.get(tabId);
-  if (!session) return;
-  if (session.detachTimer) clearTimeout(session.detachTimer);
-  nativeDebuggerSessions.delete(tabId);
-  if (session.attached) await chrome.debugger.detach(session.target).catch(() => {});
 }
 
 async function getSettings() {
@@ -1882,7 +1525,7 @@ async function enforceRuntimeGptWorkerLimit() {
   for (const state of excess) {
     await releaseRuntimeGptBatchRequests(
       state.batch_id,
-      "The GPT worker pool was reduced to five persistent tabs.",
+      "The GPT worker pool was reduced to three persistent tabs.",
       0
     );
     await removeStoredRuntimeGptBatchState(state.batch_id);

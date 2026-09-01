@@ -5,9 +5,9 @@ import test from "node:test";
 const backgroundSource = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
 const workerSource = await readFile(new URL("../extension/gpt-answer-worker.js", import.meta.url), "utf8");
 
-test("five persistent GPT workers isolate one application per prompt", () => {
+test("three persistent GPT workers process one application per prompt", () => {
   assert.match(backgroundSource, /const RUNTIME_GPT_PROMPT_BATCH_SIZE = 1;/);
-  assert.match(backgroundSource, /const RUNTIME_GPT_MAX_WORKERS = 5;/);
+  assert.match(backgroundSource, /const RUNTIME_GPT_MAX_WORKERS = 3;/);
   assert.match(workerSource, /const MAX_REQUESTS_PER_PROMPT = 1;/);
   assert.match(workerSource, /one application per prompt/i);
 });

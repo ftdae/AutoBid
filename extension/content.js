@@ -2998,7 +2998,10 @@ async function setFileInputValueNatively(input, file, payload) {
     };
   } catch (error) {
     return {
-      attempted: true,
+      // With debugger-free operation, allow the existing in-page DataTransfer
+      // fallback to run instead of treating an unavailable native transport as
+      // a completed upload attempt.
+      attempted: false,
       attached: false,
       uploaded: false,
       reason: error.message || String(error)

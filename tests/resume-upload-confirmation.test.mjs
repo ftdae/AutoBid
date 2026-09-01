@@ -21,18 +21,17 @@ test("resume metadata lookup crosses open shadow-root component hosts", () => {
   assert.match(contentSource, /spl-dropzone/);
 });
 
-test("native file uploads are serialized and reconnect once after debugger detachment", () => {
-  assert.match(backgroundSource, /queueNativeInput\(tabId, \(\) => dispatchNativeFileUpload/);
-  assert.match(backgroundSource, /dispatchNativeFileUpload\(tabId, payload, reconnectAttempt \+ 1\)/);
-  assert.match(backgroundSource, /dispatchNativeFileChooserUpload\(tabId, payload, reconnectAttempt \+ 1\)/);
+test("resume upload stays debugger-free and falls back to the existing page bridge", () => {
+  assert.doesNotMatch(backgroundSource, /chrome\.debugger/);
+  assert.match(backgroundSource, /Debugger-free mode uses the page file-input bridge instead/);
+  assert.match(contentSource, /attempted: false,[\s\S]*allow the existing in-page DataTransfer/);
 });
 
 test("resume upload never sends a backend-local filesystem path to Chrome", () => {
   assert.doesNotMatch(backgroundSource, /DOM\.setFileInputFiles/);
-  assert.match(backgroundSource, /function setDebuggerFileInputFromBytes/);
-  assert.match(backgroundSource, /const file = new File\(\[bytes\], filename/);
-  assert.match(backgroundSource, /const transfer = new DataTransfer\(\)/);
-  assert.match(backgroundSource, /transport: "bytes"/);
+  assert.match(pageHelperSource, /function fileFromBase64/);
+  assert.match(pageHelperSource, /return new File\(\[bytes\], name/);
+  assert.match(pageHelperSource, /const transfer = new DataTransfer\(\)/);
   assert.doesNotMatch(sheetsSource, /autobid-resumes|local_path|writeResumePayloadToLocalFile/);
 });
 
@@ -69,7 +68,8 @@ test("Teamtailor waits for Dropzone completion and does not cascade upload trans
   assert.match(contentSource, /if \(nativeResult\.attempted\) return false/);
   assert.match(contentSource, /resume:managed-upload-resumed/);
   assert.match(contentSource, /getManagedResumeUploadContext\(input\)\.managed \? \["change"\] : \["input", "change"\]/);
-  assert.match(backgroundSource, /duplicateSuppressed: true/);
+  assert.match(pageHelperSource, /data-auto-bid-file-upload-key/);
+  assert.match(pageHelperSource, /=== uploadFingerprint\)[\s\S]*return true/);
   assert.match(contentSource, /function getTeamtailorResumeFileInputs/);
   assert.match(contentSource, /data-forms--inputs--upload-required-value/);
   assert.match(contentSource, /data-forms--inputs--upload-accepted-files-value/);

@@ -4,6 +4,8 @@ import test from "node:test";
 
 const contentSource = await readFile(new URL("../extension/content.js", import.meta.url), "utf8");
 const backgroundSource = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+const gptWorkerSource = await readFile(new URL("../extension/gpt-answer-worker.js", import.meta.url), "utf8");
+const manifestSource = await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8");
 const atsAdapterSource = await readFile(new URL("../extension/content-modules/ats-adapters.js", import.meta.url), "utf8");
 
 test("generated answers stop retrying a field after three failed fills", () => {
@@ -139,18 +141,30 @@ test("location autocomplete primes with country for two seconds before selecting
   assert.match(contentSource, /text\.includes\(answer\) && text\.includes\(country\)/);
 });
 
-test("native dropdown input reconnects after Chrome detaches its debugger session", () => {
-  assert.match(backgroundSource, /chrome\.debugger\?\.onDetach\?\.addListener/);
-  assert.match(backgroundSource, /isDetachedNativeDebuggerError/);
-  assert.match(backgroundSource, /attempt <= 2/);
+test("dropdown fallbacks use page-world actions without Chrome debugger attachment", () => {
+  assert.match(backgroundSource, /func: clickPagePoint/);
+  assert.match(backgroundSource, /func: typeIntoFocusedPageControl/);
+  assert.doesNotMatch(backgroundSource, /chrome\.debugger/);
+  assert.doesNotMatch(manifestSource, /"debugger"/);
 });
 
-test("inactive GPT and application tabs receive lifecycle and focus emulation", () => {
-  assert.match(backgroundSource, /Page\.setWebLifecycleState/);
-  assert.match(backgroundSource, /Emulation\.setFocusEmulationEnabled/);
+test("inactive GPT and application tabs stay non-discardable without a debugger banner", () => {
   assert.match(backgroundSource, /autoDiscardable: false/);
+  assert.match(backgroundSource, /debugger-free tab protection enabled/);
   assert.match(backgroundSource, /RUNTIME_GPT_DELIVERY_ATTEMPTS = 3/);
   assert.match(contentSource, /return true;\s*\n\s*}\s*\n\s*return false;/);
+});
+
+test("inactive ChatGPT tabs submit immediately in the existing conversation", () => {
+  const askSource = gptWorkerSource.slice(
+    gptWorkerSource.indexOf("async function askChatGpt"),
+    gptWorkerSource.indexOf("async function saveAnswersWithRetry")
+  );
+  assert.match(askSource, /await setComposerText\(composer, prompt\);[\s\S]*await clickSend\(composer\);/);
+  assert.doesNotMatch(askSource, /sleepInterruptible\(250\)/);
+  assert.doesNotMatch(gptWorkerSource, /startFreshChat|findNewChatButton|AUTOBID_GPT_NATIVE_SUBMIT/);
+  assert.match(gptWorkerSource, /button\.click\(\)/);
+  assert.match(gptWorkerSource, /form\.requestSubmit\(\)/);
 });
 
 test("current BambooHR Fabric selects expose state and country choices", () => {

@@ -1,5 +1,5 @@
 (() => {
-  const WORKER_BUILD_ID = "2026-09-01-partial-quality-v4";
+  const WORKER_BUILD_ID = "2026-09-01-persistent-chat-three-workers-v6";
   if (window.__autoBidGptAnswerWorkerBuildId === WORKER_BUILD_ID) return;
   window.__autoBidGptAnswerWorkerBuildId = WORKER_BUILD_ID;
   window.__autoBidGptAnswerWorkerLoaded = true;
@@ -22,8 +22,8 @@
   const ROW_COMPLETION_COOLDOWN_MS = 30000;
   const RUN_ONCE_MAX_ROWS = 200;
   const ROW_CHAT_ATTEMPTS = 2;
-  // One application per prompt prevents cross-application omissions and context
-  // leakage. Five persistent browser workers still run these prompts in parallel.
+  // One application per prompt keeps result parsing deterministic. Three
+  // persistent browser workers run those prompts in parallel in their existing chats.
   const MAX_REQUESTS_PER_PROMPT = 1;
 
   let running = false;
@@ -447,12 +447,10 @@
 
   async function askChatGpt(prompt, fields) {
     throwIfStopped();
-    await startFreshChat();
     const beforeCount = getAssistantMessages().length;
     const composer = await waitForComposer();
     throwIfStopped();
     await setComposerText(composer, prompt);
-    await sleepInterruptible(250);
     throwIfStopped();
     await clickSend(composer);
     return waitForAssistantResponse(beforeCount, (text) => hasUsableAnswerJson(text, fields));
@@ -460,41 +458,13 @@
 
   async function askChatGptBatch(prompt, rows) {
     throwIfStopped();
-    // Keep the browser tab, but reset the conversation so an unlimited stream of
-    // batches does not accumulate context or leak one application's facts into another.
-    await startFreshChat();
     const beforeCount = getAssistantMessages().length;
     const composer = await waitForComposer();
     throwIfStopped();
     await setComposerText(composer, prompt);
-    await sleepInterruptible(250);
     throwIfStopped();
     await clickSend(composer);
     return waitForAssistantResponse(beforeCount, (text) => hasUsableBatchAnswerJson(text, rows));
-  }
-
-  async function startFreshChat() {
-    const button = findNewChatButton();
-    if (!button) return;
-    const previousUrl = window.location.href;
-    button.click();
-    const started = Date.now();
-    while (Date.now() - started < 5000) {
-      await sleepInterruptible(100);
-      const composer = findComposer();
-      const conversationCleared = getAssistantMessages().length === 0;
-      if (composer && isVisible(composer) && (window.location.href !== previousUrl || conversationCleared)) return;
-    }
-  }
-
-  function findNewChatButton() {
-    return document.querySelector("a[aria-label*='New chat' i], button[aria-label*='New chat' i], a[href='/']") ||
-      Array.from(document.querySelectorAll("a, button")).find((element) => {
-        if (!isVisible(element)) return false;
-        const text = `${element.textContent || ""} ${element.getAttribute("aria-label") || ""}`.trim();
-        return /\bnew chat\b/i.test(text);
-      }) ||
-      null;
   }
 
   async function saveAnswersWithRetry(row, answers, batchId = "") {
@@ -599,20 +569,22 @@
   }
 
   async function clickSend(composer) {
-    const started = Date.now();
+    throwIfStopped();
+    const button = findSendButton();
+    if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") {
+      button.click();
+      return { sent: true, method: "dom-send-button" };
+    }
 
-    while (Date.now() - started < 15000) {
-      throwIfStopped();
-      const button = findSendButton();
-      if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") {
-        button.click();
-        return;
-      }
-      await sleepInterruptible(250);
+    const form = composer.closest("form");
+    if (form?.requestSubmit) {
+      form.requestSubmit();
+      return { sent: true, method: "dom-request-submit" };
     }
 
     composer.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
     composer.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+    return { sent: true, method: "dom-enter-fallback" };
   }
 
   function findSendButton() {

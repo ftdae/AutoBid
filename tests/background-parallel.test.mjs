@@ -20,7 +20,6 @@ function installChromeMock() {
   const tabs = new Map();
   const runningWorkerTabs = new Set();
   const workerRunMessages = [];
-  const debuggerCommands = [];
   let nextTabId = 1000;
 
   const clone = (value) => value === undefined ? undefined : structuredClone(value);
@@ -97,19 +96,10 @@ function installChromeMock() {
     },
     scripting: {
       executeScript: async () => []
-    },
-    debugger: {
-      onEvent: createEvent(),
-      attach: async () => {},
-      detach: async () => {},
-      sendCommand: async (target, method, params) => {
-        debuggerCommands.push({ tabId: target.tabId, method, params: clone(params) });
-        return {};
-      }
     }
   };
 
-  return { storage, runtimeOnMessage, tabs, runningWorkerTabs, workerRunMessages, debuggerCommands };
+  return { storage, runtimeOnMessage, tabs, runningWorkerTabs, workerRunMessages };
 }
 
 function waitFor(predicate, timeoutMs = 5000) {
@@ -157,7 +147,7 @@ test("the first autofill hotkey prewarms one idle GPT tab without sending an emp
   assert.equal(mock.tabs.get(worker.tab_id)?.autoDiscardable, false);
 });
 
-test("50 runtime GPT requests use at most five persistent tabs and each tab accepts more work", async () => {
+test("50 runtime GPT requests use at most three persistent tabs and each tab accepts more work", async () => {
   const mock = installChromeMock();
   await import(`../extension/background.js?parallel-test=${Date.now()}`);
   const listener = mock.runtimeOnMessage.listeners[0];
@@ -185,29 +175,19 @@ test("50 runtime GPT requests use at most five persistent tabs and each tab acce
     const requests = mock.storage.autoBidRuntimeGptQueueV2?.requests || [];
     const states = mock.storage.autoBidGptBatchStatesV2 || [];
     return requests.length === 50 &&
-      requests.filter((request) => request.status === "processing").length === 5 &&
-      requests.filter((request) => request.status === "pending").length === 45 &&
-      states.length === 5 &&
+      requests.filter((request) => request.status === "processing").length === 3 &&
+      requests.filter((request) => request.status === "pending").length === 47 &&
+      states.length === 3 &&
       states.every((state) => state.request_ids.length === 1);
   });
 
   const initialRequests = mock.storage.autoBidRuntimeGptQueueV2.requests;
   const initialStates = mock.storage.autoBidGptBatchStatesV2;
-  assert.equal(initialStates.length, 5);
-  assert.equal(mock.tabs.size, 5);
-  assert.equal(new Set(initialRequests.filter((request) => request.status === "processing").map((request) => request.batch_id)).size, 5);
+  assert.equal(initialStates.length, 3);
+  assert.equal(mock.tabs.size, 3);
+  assert.equal(new Set(initialRequests.filter((request) => request.status === "processing").map((request) => request.batch_id)).size, 3);
   for (const state of initialStates) {
     assert.equal(mock.tabs.get(state.tab_id)?.autoDiscardable, false);
-    assert.ok(mock.debuggerCommands.some((command) => (
-      command.tabId === state.tab_id &&
-      command.method === "Page.setWebLifecycleState" &&
-      command.params?.state === "active"
-    )));
-    assert.ok(mock.debuggerCommands.some((command) => (
-      command.tabId === state.tab_id &&
-      command.method === "Emulation.setFocusEmulationEnabled" &&
-      command.params?.enabled === true
-    )));
   }
 
   const reusedWorker = structuredClone(initialStates[0]);
@@ -241,14 +221,14 @@ test("50 runtime GPT requests use at most five persistent tabs and each tab acce
     const requests = mock.storage.autoBidRuntimeGptQueueV2?.requests || [];
     const states = mock.storage.autoBidGptBatchStatesV2 || [];
     const state = states.find((item) => item.batch_id === reusedWorker.batch_id);
-    return states.length === 5 &&
+    return states.length === 3 &&
       state?.request_ids?.length === 1 &&
       !state.request_ids.some((requestId) => reusedWorker.request_ids.includes(requestId)) &&
       requests.filter((request) => request.status === "complete").length === 1 &&
-      requests.filter((request) => request.status === "processing").length === 5;
+      requests.filter((request) => request.status === "processing").length === 3;
   });
 
-  assert.equal(mock.tabs.size, 5);
+  assert.equal(mock.tabs.size, 3);
   assert.ok(mock.workerRunMessages.filter((message) => message.tabId === reusedWorker.tab_id).length >= 2);
 });
 
