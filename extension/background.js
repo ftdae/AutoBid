@@ -548,7 +548,8 @@ async function updateAutofillTabState(payload = {}, sender = {}) {
   const tabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : null;
   if (!Number.isInteger(tabId)) return { updated: false, reason: "missing-tab" };
   const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
-  const holdReason = `autofill-run:${frameId}`;
+  const runId = String(payload.run_id || payload.runId || "legacy");
+  const holdReason = `autofill-run:${frameId}:${runId}`;
   if (payload.running !== false) {
     await holdBackgroundTabAutomation(tabId, holdReason);
     await releaseBackgroundTabAutomation(tabId, "autofill-bootstrap").catch(() => {});
@@ -811,6 +812,7 @@ async function createRuntimeGptAnswerRequest(payload = {}, sender = {}) {
     worker_tab_id: null,
     tab_id: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
     frame_id: Number.isInteger(sender?.frameId) ? sender.frameId : 0,
+    client_run_id: String(payload.client_run_id || payload.clientRunId || ""),
     context,
     page,
     payload: payload.payload,
@@ -1090,6 +1092,7 @@ async function notifyRuntimeGptAnswersReady(request) {
           answers: request.answers || [],
           fields: Array.isArray(request.payload?.fields) ? request.payload.fields : [],
           page_url: request.page?.url || request.payload?.page?.url || "",
+          client_run_id: request.client_run_id || "",
           delivery_attempt: attempt
         }
       }, { frameId: Number.isInteger(request.frame_id) ? request.frame_id : 0 });

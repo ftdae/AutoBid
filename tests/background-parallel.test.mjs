@@ -166,6 +166,7 @@ test("50 runtime GPT requests use at most three persistent tabs and each tab acc
       context: {},
       page: { url: `https://jobs.example.test/${index}` },
       payload: { fields: [{ field_id: `field_${index}`, required: true }] },
+      client_run_id: `run_${index}`,
       timeout_ms: 90000
     }
   }, { tab: { id: index + 1 }, frameId: 0 })));
@@ -183,6 +184,7 @@ test("50 runtime GPT requests use at most three persistent tabs and each tab acc
 
   const initialRequests = mock.storage.autoBidRuntimeGptQueueV2.requests;
   const initialStates = mock.storage.autoBidGptBatchStatesV2;
+  assert.equal(initialRequests.find((request) => request.payload.fields[0].field_id === "field_0")?.client_run_id, "run_0");
   assert.equal(initialStates.length, 3);
   assert.equal(mock.tabs.size, 3);
   assert.equal(new Set(initialRequests.filter((request) => request.status === "processing").map((request) => request.batch_id)).size, 3);

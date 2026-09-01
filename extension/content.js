@@ -149,6 +149,7 @@ let tracePublishTimer = null;
 const runtimeGptSourceFields = new Map();
 const runtimeGptAnswersByRequest = new Map();
 const runtimeGptApplyPromises = new Map();
+const finalizedRuntimeGptRequestIds = new Set();
 const generatedAnswerFillAttempts = new Map();
 const atsAdapters = window.AutoBidAtsAdapters?.create({
   queryAll,
@@ -193,9 +194,9 @@ runAutoBid();
 async function runAutoBid() {
   if (!isActiveContentInstance() || autoBidRunning) return;
   autoBidRunning = true;
-  send("AUTOBID_AUTOFILL_STATE", { running: true, url: location.href }).catch(() => {});
   lastNativeClickError = null;
   resetTrace();
+  send("AUTOBID_AUTOFILL_STATE", { running: true, run_id: autoBidRunId, url: location.href }).catch(() => {});
   traceAutoBid("run:start", {
     url: location.href,
     title: document.title,
@@ -226,7 +227,7 @@ async function runAutoBid() {
     flushTrace();
     showStatus(embeddedFrames ? "Checking embedded application frames..." : "No fillable fields found.", embeddedFrames ? "success" : "error");
     autoBidRunning = false;
-    await send("AUTOBID_AUTOFILL_STATE", { running: false, reason: "no-fields", url: location.href }).catch(() => {});
+    await send("AUTOBID_AUTOFILL_STATE", { running: false, run_id: autoBidRunId, reason: "no-fields", url: location.href }).catch(() => {});
     return;
   }
 
@@ -319,7 +320,7 @@ async function runAutoBid() {
   } finally {
     flushTrace();
     autoBidRunning = false;
-    await send("AUTOBID_AUTOFILL_STATE", { running: false, reason: "run-finished", url: location.href }).catch(() => {});
+    await send("AUTOBID_AUTOFILL_STATE", { running: false, run_id: autoBidRunId, reason: "run-finished", url: location.href }).catch(() => {});
   }
 }
 
@@ -1060,7 +1061,11 @@ function isCompositeComboboxShell(control) {
 
 function getControlOptions(control) {
   if (control.tagName === "SELECT") {
-    return Array.from(control.options).map((option) => option.textContent.trim()).filter(Boolean);
+    return Array.from(control.options)
+      .filter((option) => !option.disabled)
+      .map((option) => ({ text: cleanLabel(option.textContent || ""), value: cleanLabel(option.value || "") }))
+      .filter((option) => option.text && !isGeneratedChoicePlaceholder(option.text, option.value))
+      .map((option) => option.text);
   }
   if (getControlType(control) === "combobox") {
     const options = [
@@ -1588,6 +1593,20 @@ function getCurrentlyFilledFieldIds(fields) {
   for (const field of fields) {
     if (hasFieldCurrentValue(field)) filledIds.add(field.id);
   }
+
+  const checkboxGroups = new Map();
+  for (const field of fields) {
+    if (field.type !== "checkbox" || !field.option || !field.name) continue;
+    const key = normalize(field.name);
+    if (!key) continue;
+    if (!checkboxGroups.has(key)) checkboxGroups.set(key, []);
+    checkboxGroups.get(key).push(field);
+  }
+  for (const group of checkboxGroups.values()) {
+    if (group.length < 2 || !group.some((field) => hasFieldCurrentValue(field))) continue;
+    group.forEach((field) => filledIds.add(field.id));
+  }
+
   return filledIds;
 }
 
@@ -1666,28 +1685,18 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
     }
 
     const alreadyFilled = hasFieldCurrentValue(field, controls);
-    if (alreadyFilled && !isGeneratedAnswerChoiceField(field)) {
+    if (alreadyFilled) {
       traceAutoBid("answer:skipped-filled", {
         field_id: field.id,
         requested_field_id: requestedFieldId,
         answer: answer.value || "",
         source: answer.source || "",
         current: getCurrentChoiceSummary(controls),
-        reason: "preserve-existing-non-choice-value"
+        reason: "preserve-current-value"
       });
       filledIds.add(requestedFieldId);
       filledIds.add(field.id);
       continue;
-    }
-
-    if (alreadyFilled) {
-      traceAutoBid("answer:replacing-mismatched-choice", {
-        field_id: field.id,
-        requested_field_id: requestedFieldId,
-        answer: answer.value || "",
-        source: answer.source || "",
-        current: getCurrentChoiceSummary(controls)
-      });
     }
 
     const previousAttempts = getGeneratedAnswerFillAttempts(attemptKey);
@@ -3629,12 +3638,33 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
   }
 
   await hydrateGeneratedChoiceOptions(candidateFields);
+  const unresolvedCandidateFields = candidateFields.filter((field) => !hasFieldCurrentValue(field));
+  const incompleteChoiceFields = unresolvedCandidateFields.filter((field) => !hasCompleteGeneratedChoiceOptions(field));
+  const requestableFields = unresolvedCandidateFields.filter((field) => hasCompleteGeneratedChoiceOptions(field));
+  if (incompleteChoiceFields.length > 0) {
+    traceAutoBid("runtime-gpt:choice-options-unavailable", {
+      fields: incompleteChoiceFields.map((field) => ({
+        field_id: field.id,
+        question: field.question || field.label,
+        type: field.type
+      }))
+    });
+  }
+  if (requestableFields.length === 0) {
+    return {
+      filled: 0,
+      missed: incompleteChoiceFields.length,
+      pending: 0,
+      filledIds: localFilledIds,
+      missedIds: new Set(incompleteChoiceFields.map((field) => field.id))
+    };
+  }
 
-  const candidateIds = new Set(candidateFields.map((field) => field.id));
+  const candidateIds = new Set(requestableFields.map((field) => field.id));
   const activeFilledIds = new Set(filledIds);
-  let remaining = candidateFields.filter((field) => !activeFilledIds.has(field.id) && !hasFieldCurrentValue(field));
+  let remaining = requestableFields.filter((field) => !activeFilledIds.has(field.id) && !hasFieldCurrentValue(field));
   if (remaining.length === 0) {
-    return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
+    return { filled: 0, missed: incompleteChoiceFields.length, pending: 0, filledIds: localFilledIds };
   }
 
   const profileContext = await getGeneratedAnswerProfileContext();
@@ -3664,12 +3694,13 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
       context,
       page,
       payload,
+      client_run_id: autoBidRunId,
       timeout_ms: RUNTIME_GPT_ANSWER_TIMEOUT_MS,
       max_attempts: 1
     });
   } catch (error) {
     traceAutoBid("runtime-gpt:start-error", { message: error.message || String(error) });
-    return { filled: 0, missed: 0, pending: remaining.length, filledIds: localFilledIds };
+    return { filled: 0, missed: incompleteChoiceFields.length, pending: remaining.length, filledIds: localFilledIds };
   }
 
   const requestId = request?.request_id || request?.requestId || "";
@@ -3677,12 +3708,15 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
   showStatus(`Sent ${remaining.length} question${remaining.length === 1 ? "" : "s"} to ChatGPT worker`, "success");
 
   const status = await waitForRuntimeGptAnswer(requestId);
+  if (!isActiveContentInstance()) {
+    return { filled: 0, missed: 0, pending: 0, request_id: requestId, filledIds: localFilledIds, ignored: true, reason: "superseded-run" };
+  }
   if (status?.status === "error") {
     traceAutoBid("runtime-gpt:error", {
       request_id: status.request_id || status.requestId || "",
       message: status.error || ""
     });
-    return { filled: 0, missed: remaining.length, pending: 0, request_id: requestId, filledIds: localFilledIds };
+    return { filled: 0, missed: remaining.length + incompleteChoiceFields.length, pending: 0, request_id: requestId, filledIds: localFilledIds };
   }
 
   if (status?.status !== "complete") {
@@ -3691,7 +3725,7 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
       status: status?.status || "timeout",
       remaining: remaining.length
     });
-    return { filled: 0, missed: 0, pending: remaining.length, request_id: requestId, filledIds: localFilledIds };
+    return { filled: 0, missed: incompleteChoiceFields.length, pending: remaining.length, request_id: requestId, filledIds: localFilledIds };
   }
 
   const answers = normalizeRuntimeGptAnswers(status)
@@ -3702,7 +3736,7 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
       request_id: status.request_id || status.requestId || "",
       answers: Array.isArray(status.answers) ? status.answers.length : 0
     });
-    return { filled: 0, missed: remaining.length, pending: 0, filledIds: localFilledIds };
+    return { filled: 0, missed: remaining.length + incompleteChoiceFields.length, pending: 0, filledIds: localFilledIds };
   }
 
   traceAutoBid("runtime-gpt:answers-received", {
@@ -3715,11 +3749,11 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
 
   const result = await applyRuntimeGptAnswersOnce(requestId, answers, remaining, activeFilledIds);
   result.filledIds.forEach((fieldId) => localFilledIds.add(fieldId));
-  remaining = candidateFields.filter((field) => !result.filledIds.has(field.id) && !hasFieldCurrentValue(field));
+  remaining = requestableFields.filter((field) => !result.filledIds.has(field.id) && !hasFieldCurrentValue(field));
 
   return {
     filled: result.filled,
-    missed: result.missed,
+    missed: result.missed + incompleteChoiceFields.length,
     pending: 0,
     remaining: remaining.length,
     request_id: requestId,
@@ -3730,6 +3764,24 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
 async function applyPushedRuntimeGptAnswers(payload) {
   const requestId = String(payload.request_id || payload.requestId || "");
   if (!requestId) return emptyFillResult();
+  const clientRunId = String(payload.client_run_id || payload.clientRunId || "");
+  const knownToActiveRun = runtimeGptSourceFields.has(requestId);
+  if ((clientRunId && clientRunId !== autoBidRunId) || (!clientRunId && !knownToActiveRun)) {
+    traceAutoBid("runtime-gpt:push-ignored-stale-run", {
+      request_id: requestId,
+      request_run_id: clientRunId,
+      active_run_id: autoBidRunId,
+      legacy_untagged: !clientRunId
+    });
+    flushTrace();
+    return { ...emptyFillResult(), applied: false, settled: true, ignored: true, reason: "stale-run" };
+  }
+
+  if (finalizedRuntimeGptRequestIds.has(requestId)) {
+    traceAutoBid("runtime-gpt:push-ignored-finalized", { request_id: requestId });
+    flushTrace();
+    return { ...emptyFillResult(), applied: false, settled: true, ignored: true, reason: "already-finalized" };
+  }
 
   if (!runtimeGptSourceFields.has(requestId) && Array.isArray(payload.fields)) {
     runtimeGptSourceFields.set(requestId, payload.fields.map((field) => ({
@@ -3776,6 +3828,15 @@ async function applyPushedRuntimeGptAnswers(payload) {
 function getRuntimeGptAnswerSettlement(requestId) {
   const answers = runtimeGptAnswersByRequest.get(requestId) || [];
   const sourceFields = runtimeGptSourceFields.get(requestId) || [];
+  if (finalizedRuntimeGptRequestIds.has(requestId)) {
+    return {
+      settled: true,
+      filled: 0,
+      exhausted: 0,
+      pending: 0,
+      max_attempts: 1
+    };
+  }
   const sourceById = new Map(sourceFields.map((field) => [field.id, field]));
   let filled = 0;
   let exhausted = 0;
@@ -3805,6 +3866,9 @@ function getRuntimeGptAnswerSettlement(requestId) {
 }
 
 function applyRuntimeGptAnswersOnce(requestId, rawAnswers, fallbackFields = [], skipFilledIds = new Set()) {
+  if (finalizedRuntimeGptRequestIds.has(requestId)) {
+    return Promise.resolve({ ...emptyFillResult(), ignored: true, reason: "already-finalized" });
+  }
   if (runtimeGptApplyPromises.has(requestId)) return runtimeGptApplyPromises.get(requestId);
 
   const promise = (async () => {
@@ -3815,7 +3879,15 @@ function applyRuntimeGptAnswersOnce(requestId, rawAnswers, fallbackFields = [], 
     if (answers.length === 0) return emptyFillResult();
 
     runtimeGptAnswersByRequest.set(requestId, answers);
-    return applyAnswers(answers, skipFilledIds, sourceFields);
+    try {
+      return await applyAnswers(answers, skipFilledIds, sourceFields);
+    } finally {
+      finalizedRuntimeGptRequestIds.add(requestId);
+      traceAutoBid("runtime-gpt:request-finalized", {
+        request_id: requestId,
+        answers: answers.length
+      });
+    }
   })().finally(() => {
     runtimeGptApplyPromises.delete(requestId);
   });
@@ -4101,23 +4173,44 @@ function getGeneratedAnswerCandidateFields(fields, filledIds) {
 
 async function hydrateGeneratedChoiceOptions(fields) {
   for (const field of fields) {
-    if (!field || field.options?.length > 0 || field.type !== "combobox") continue;
+    if (!field || !CHOICE_FIELD_TYPES.includes(field.type)) continue;
     const controls = getControlsByFieldId(field.id);
     const control = controls[0];
     if (!control || hasFieldCurrentValue(field, controls)) continue;
 
-    await clearComboboxSearchValue(control);
-    const options = await getComboboxChoices(control);
-    field.options = uniqueNonEmptyValues(options.map((option) => cleanLabel(
-      option.textContent || option.getAttribute("data-value") || option.getAttribute("value") || ""
-    )));
+    let discoveredOptions = [];
+    if (field.type === "combobox") {
+      await clearComboboxSearchValue(control);
+      const options = await getComboboxChoices(control);
+      discoveredOptions = options.map((option) => cleanLabel(
+        option.textContent || option.getAttribute("data-value") || option.getAttribute("value") || ""
+      ));
+      await closeCombobox(control);
+    } else if (field.type === "radio") {
+      discoveredOptions = controls.map(getRadioOptionLabel);
+    } else if (field.type === "button-group") {
+      discoveredOptions = controls.map(getChoiceButtonLabel);
+    } else if (field.type === "checkbox") {
+      discoveredOptions = ["Yes", "No"];
+    } else {
+      discoveredOptions = getControlOptions(control);
+    }
+
+    field.options = uniqueNonEmptyValues([...(field.options || []), ...discoveredOptions])
+      .filter((option) => !isGeneratedChoicePlaceholder(option, option));
     traceAutoBid("ai:choice-options-hydrated", {
       field_id: field.id,
       label: field.label,
-      options: field.options
+      type: field.type,
+      options: field.options,
+      complete: field.options.length > 0
     });
-    await closeCombobox(control);
   }
+}
+
+function hasCompleteGeneratedChoiceOptions(field) {
+  if (!CHOICE_FIELD_TYPES.includes(field?.type)) return true;
+  return Array.isArray(field.options) && field.options.some((option) => !isGeneratedChoicePlaceholder(option, option));
 }
 
 function getGeneratedAnswerCandidateSkipReason(field, filledIds) {
@@ -5890,6 +5983,7 @@ function isSensitiveOrPersonalChoiceCheckbox(label) {
 }
 
 async function setControlsValue(controls, value, field = null, context = {}) {
+  if (!isActiveContentInstance()) return false;
   const first = controls[0];
   const type = getControlType(first);
   const textValue = String(value || "").trim();
@@ -6531,7 +6625,10 @@ async function setComboboxValue(control, value, field = null, context = {}) {
 
 async function getComboboxChoices(control, filterValue, options = {}) {
   const choices = await openCombobox(control, filterValue, options);
-  return choices.filter((option) => !isPlaceholderChoice(option.textContent, option.getAttribute("data-value") || option.getAttribute("value") || ""));
+  return choices.filter((option) => !isGeneratedChoicePlaceholder(
+    option.textContent,
+    option.getAttribute("data-value") || option.getAttribute("value") || ""
+  ));
 }
 
 async function openCombobox(control, filterValue, config = {}) {
@@ -7384,6 +7481,12 @@ function scorePositiveChoice(label, choiceText, index) {
   return score;
 }
 
+function isGeneratedChoicePlaceholder(text, value) {
+  const normalizedText = normalize(text);
+  if (/^(?:n a|not applicable)$/.test(normalizedText)) return false;
+  return isPlaceholderChoice(text, value);
+}
+
 function isPlaceholderChoice(text, value) {
   const normalizedText = normalize(text);
   const normalizedValue = normalize(value);
@@ -7449,6 +7552,7 @@ function scoreChoice(choice, answer) {
 }
 
 function showStatus(message, kind) {
+  if (!isActiveContentInstance()) return;
   let status = document.getElementById(STATUS_ID);
   if (!status) {
     status = document.createElement("div");

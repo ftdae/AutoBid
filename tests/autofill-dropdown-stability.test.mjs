@@ -23,6 +23,38 @@ test("generated answers stop retrying a field after three failed fills", () => {
   assert.doesNotMatch(pushedAnswerHandler, /applyProfileStaticFallbacks|reapplyRuntimeGptAnswers/);
 });
 
+test("a GPT delivery is finalized after one application pass and duplicate or stale pushes are ignored", () => {
+  assert.match(contentSource, /const finalizedRuntimeGptRequestIds = new Set\(\)/);
+  assert.match(contentSource, /runtime-gpt:request-finalized/);
+  assert.match(contentSource, /runtime-gpt:push-ignored-finalized/);
+  assert.match(contentSource, /runtime-gpt:push-ignored-stale-run/);
+  assert.match(contentSource, /client_run_id: autoBidRunId/);
+  assert.match(backgroundSource, /client_run_id: request\.client_run_id \|\| ""/);
+  assert.match(contentSource, /if \(!isActiveContentInstance\(\)\) return false;[\s\S]*const first = controls\[0\]/);
+  assert.match(contentSource, /reason: "superseded-run"/);
+  assert.match(backgroundSource, /const holdReason = `autofill-run:\$\{frameId\}:\$\{runId\}`/);
+});
+
+test("generated answers preserve every current manual value including choice controls", () => {
+  const applySource = contentSource.slice(
+    contentSource.indexOf("async function applyAnswers"),
+    contentSource.indexOf("function getGeneratedAnswerAttemptKey")
+  );
+  assert.match(applySource, /if \(alreadyFilled\)/);
+  assert.match(applySource, /reason: "preserve-current-value"/);
+  assert.doesNotMatch(applySource, /replacing-mismatched-choice/);
+});
+
+test("later hotkey runs treat a selected required checkbox group as complete", () => {
+  const filledSource = contentSource.slice(
+    contentSource.indexOf("function getCurrentlyFilledFieldIds"),
+    contentSource.indexOf("async function closeOpenChoiceMenus")
+  );
+  assert.match(filledSource, /const checkboxGroups = new Map\(\)/);
+  assert.match(filledSource, /group\.some\(\(field\) => hasFieldCurrentValue\(field\)\)/);
+  assert.match(filledSource, /group\.forEach\(\(field\) => filledIds\.add\(field\.id\)\)/);
+});
+
 test("Ashby-style checkbox questions use explicit verified Yes or No choices", () => {
   assert.match(contentSource, /const CHOICE_FIELD_TYPES = \["select", "radio", "checkbox", "combobox", "button-group"\]/);
   assert.match(contentSource, /function getCheckboxBooleanChoiceOptions/);
@@ -108,6 +140,9 @@ test("dynamic dropdown options are collected before an AI request", () => {
   assert.match(contentSource, /await hydrateGeneratedChoiceOptions\(candidateFields\)/);
   assert.match(contentSource, /ai:choice-options-hydrated/);
   assert.match(contentSource, /field\.options = uniqueNonEmptyValues/);
+  assert.match(contentSource, /function hasCompleteGeneratedChoiceOptions/);
+  assert.match(contentSource, /runtime-gpt:choice-options-unavailable/);
+  assert.match(contentSource, /const requestableFields = unresolvedCandidateFields\.filter\(\(field\) => hasCompleteGeneratedChoiceOptions\(field\)\)/);
 });
 
 test("a native click is verified and falls back to the page bridge before keyboard opening", () => {
