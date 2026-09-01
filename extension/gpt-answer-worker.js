@@ -1,5 +1,5 @@
 (() => {
-  const WORKER_BUILD_ID = "2026-08-29-persistent-pool-v2";
+  const WORKER_BUILD_ID = "2026-09-01-partial-quality-v4";
   if (window.__autoBidGptAnswerWorkerBuildId === WORKER_BUILD_ID) return;
   window.__autoBidGptAnswerWorkerBuildId = WORKER_BUILD_ID;
   window.__autoBidGptAnswerWorkerLoaded = true;
@@ -22,8 +22,9 @@
   const ROW_COMPLETION_COOLDOWN_MS = 30000;
   const RUN_ONCE_MAX_ROWS = 200;
   const ROW_CHAT_ATTEMPTS = 2;
-  // This only caps one prompt's size. A persistent worker can process unlimited batches.
-  const MAX_REQUESTS_PER_PROMPT = 5;
+  // One application per prompt prevents cross-application omissions and context
+  // leakage. Five persistent browser workers still run these prompts in parallel.
+  const MAX_REQUESTS_PER_PROMPT = 1;
 
   let running = false;
   let stopRequested = false;
@@ -769,7 +770,10 @@
       "- If the question asks about English, answer Yes. If it asks about another language and the profile does not prove it, answer No.",
       "- Ignore decorative/browser fallback text such as 'SVGs not supported by this browser'.",
       "- Keep textarea answers specific but short, usually 2 to 5 sentences.",
-      "- Answer every included field. When the profile does not support a claim, return an honest concise negative or 'Not applicable'; never omit the field."
+      "- Never answer with placeholder text such as 'Not specified', 'Unknown', 'Not provided', 'TBD', or similar.",
+      "- Use 'N/A' or 'Not applicable' only when the field's own question/help text explicitly permits it or the field is genuinely conditional and inapplicable.",
+      "- For required narrative questions, write a useful first-person answer grounded in the supplied resume/profile. If an exact claim is unsupported, describe the closest supported experience honestly instead of returning a placeholder.",
+      "- Answer every included field when possible. If one field truly cannot be answered honestly, omit only that field; keep every other valid answer."
     ];
   }
 
@@ -827,6 +831,7 @@
       option: sanitizePromptText(field.option || ""),
       label: sanitizePromptText(field.label || field.question || ""),
       raw_label: sanitizePromptText(field.raw_label || ""),
+      help_text: sanitizePromptText(field.help_text || ""),
       placeholder: sanitizePromptText(field.placeholder || ""),
       options: Array.isArray(field.options)
         ? field.options.map(sanitizePromptText).filter(Boolean)
@@ -865,7 +870,8 @@
   }
 
   function extractAnswersFromPayload(parsed, fields, options = {}) {
-    const fieldsById = new Map((fields || []).map((field) => [String(field.field_id || field.id || ""), field]));
+    const fieldList = (fields || []).filter(Boolean);
+    const fieldsById = new Map(fieldList.map((field) => [String(field.field_id || field.id || ""), field]));
     const fieldIds = new Set(Array.from(fieldsById.keys()).filter(Boolean));
     const rawAnswers = Array.isArray(parsed?.answers)
       ? parsed.answers
@@ -875,8 +881,9 @@
 
     const answers = rawAnswers
       .map((answer) => {
-        const fieldId = String(answer.field_id || answer.id || "");
-        const field = fieldsById.get(fieldId) || {};
+        const field = resolveAnswerField(answer, fieldList, fieldsById);
+        if (!field) return null;
+        const fieldId = String(field.field_id || field.id || "");
         return {
           field_id: fieldId,
           question: sanitizePromptText(answer.question || field.question || field.label || ""),
@@ -884,7 +891,12 @@
           value: sanitizePromptText(answer.value ?? answer.answer ?? "")
         };
       })
-      .filter((answer) => answer.field_id && fieldIds.has(answer.field_id) && answer.value);
+      .filter((answer) => answer?.field_id && fieldIds.has(answer.field_id) && answer.value)
+      .filter((answer) => {
+        const field = fieldsById.get(answer.field_id);
+        return !isRejectedPlaceholderAnswer(answer.value, field);
+      })
+      .filter((answer, index, items) => items.findIndex((item) => item.field_id === answer.field_id) === index);
 
     if (answers.length === 0) {
       throw new Error("ChatGPT response did not contain usable AutoBid answers.");
@@ -893,10 +905,44 @@
     const answeredFieldIds = new Set(answers.map((answer) => answer.field_id));
     const missingFieldIds = Array.from(fieldIds).filter((fieldId) => !answeredFieldIds.has(fieldId));
     if (missingFieldIds.length > 0 && options.requireComplete !== false) {
-      throw new Error(`ChatGPT response omitted ${missingFieldIds.length} AutoBid field${missingFieldIds.length === 1 ? "" : "s"}.`);
+      console.warn("[AutoBid GPT Answer Worker] ChatGPT returned a partial answer set", {
+        answered: answers.length,
+        missing_field_ids: missingFieldIds
+      });
     }
 
     return answers;
+  }
+
+  function isRejectedPlaceholderAnswer(value, field = {}) {
+    const normalized = normalizeKey(value);
+    if (!/^(?:not specified|unspecified|unknown|not provided|not available|no information(?: provided| available)?|information unavailable|to be determined|tbd)$/.test(normalized)) {
+      return false;
+    }
+    const options = Array.isArray(field?.options) ? field.options.map(normalizeKey) : [];
+    return !options.includes(normalized);
+  }
+
+  function resolveAnswerField(answer, fields, fieldsById) {
+    const requestedId = String(answer?.field_id || answer?.id || "").trim();
+    if (requestedId && fieldsById.has(requestedId)) return fieldsById.get(requestedId);
+
+    const identities = new Set([
+      requestedId,
+      answer?.question,
+      answer?.label
+    ].map(normalizeKey).filter(Boolean));
+    if (identities.size === 0) return null;
+
+    const matches = fields.filter((field) => {
+      const fieldIdentities = [
+        field.question,
+        field.label,
+        field.name
+      ].map(normalizeKey).filter(Boolean);
+      return fieldIdentities.some((identity) => identities.has(identity));
+    });
+    return matches.length === 1 ? matches[0] : null;
   }
 
   function extractBatchAnswers(responseText, rows) {
@@ -938,7 +984,7 @@
           answers: extractAnswersFromPayload(
             { answers: group.answers || group.values || [] },
             row.questions?.fields || [],
-            { requireComplete: !isRuntimeRequest(row) }
+            { requireComplete: false }
           ),
           error: null
         });
@@ -953,20 +999,7 @@
   function hasUsableAnswerJson(responseText, fields) {
     try {
       const parsed = parseJsonFromText(responseText);
-      const fieldIds = new Set((fields || []).map((field) => String(field.field_id || field.id || "")).filter(Boolean));
-      const answers = Array.isArray(parsed?.answers)
-        ? parsed.answers
-        : parsed && typeof parsed === "object"
-          ? Object.entries(parsed).map(([field_id, value]) => ({ field_id, value }))
-          : [];
-      const answeredFieldIds = new Set(answers.filter((answer) => {
-        const fieldId = String(answer.field_id || answer.id || "");
-        const value = sanitizePromptText(answer.value ?? answer.answer ?? "");
-        return fieldId && value && (!fieldIds.size || fieldIds.has(fieldId));
-      }).map((answer) => String(answer.field_id || answer.id || "")));
-      return fieldIds.size > 0
-        ? Array.from(fieldIds).every((fieldId) => answeredFieldIds.has(fieldId))
-        : answeredFieldIds.size > 0;
+      return extractAnswersFromPayload(parsed, fields, { requireComplete: false }).length > 0;
     } catch {
       return false;
     }

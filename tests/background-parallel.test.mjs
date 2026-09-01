@@ -185,10 +185,10 @@ test("50 runtime GPT requests use at most five persistent tabs and each tab acce
     const requests = mock.storage.autoBidRuntimeGptQueueV2?.requests || [];
     const states = mock.storage.autoBidGptBatchStatesV2 || [];
     return requests.length === 50 &&
-      requests.filter((request) => request.status === "processing").length === 25 &&
-      requests.filter((request) => request.status === "pending").length === 25 &&
+      requests.filter((request) => request.status === "processing").length === 5 &&
+      requests.filter((request) => request.status === "pending").length === 45 &&
       states.length === 5 &&
-      states.every((state) => state.request_ids.length === 5);
+      states.every((state) => state.request_ids.length === 1);
   });
 
   const initialRequests = mock.storage.autoBidRuntimeGptQueueV2.requests;
@@ -242,10 +242,10 @@ test("50 runtime GPT requests use at most five persistent tabs and each tab acce
     const states = mock.storage.autoBidGptBatchStatesV2 || [];
     const state = states.find((item) => item.batch_id === reusedWorker.batch_id);
     return states.length === 5 &&
-      state?.request_ids?.length === 5 &&
+      state?.request_ids?.length === 1 &&
       !state.request_ids.some((requestId) => reusedWorker.request_ids.includes(requestId)) &&
-      requests.filter((request) => request.status === "complete").length === 5 &&
-      requests.filter((request) => request.status === "processing").length === 25;
+      requests.filter((request) => request.status === "complete").length === 1 &&
+      requests.filter((request) => request.status === "processing").length === 5;
   });
 
   assert.equal(mock.tabs.size, 5);

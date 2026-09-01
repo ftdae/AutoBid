@@ -1,7 +1,8 @@
 import {
   CACHE_SCOPES,
   OPENAI_API_KEY,
-  OPENAI_MODEL
+  OPENAI_MODEL,
+  OPENAI_ROUTE_ENABLED
 } from "../config.js";
 import { logBackendEvent } from "../utils/logger.js";
 import { extractOutputText, trimForPrompt } from "../utils/text.js";
@@ -12,6 +13,8 @@ const SYSTEM_PROMPT = [
   "Do not invent employers, degrees, certifications, locations, compensation, legal eligibility, or years of experience.",
   "Use concise first-person answers unless the field asks for a different format.",
   "For select, radio, checkbox, combobox, and button-group fields with provided options, return exactly one provided option.",
+  "Never return placeholders such as Not specified, Unknown, Not provided, or TBD.",
+  "Use N/A or Not applicable only when the field instructions explicitly permit it or the question is genuinely conditional and inapplicable.",
   "Use cache_scope global only for profile-independent consent or terms answers, profile for reusable profile facts, and profile_job for job-specific answers like fit, cover letters, proposals, and bids.",
   "Answer every supplied field when an honest answer can be supported by the supplied context."
 ].join(" ");
@@ -19,6 +22,16 @@ const SYSTEM_PROMPT = [
 const OPENAI_TIMEOUT_MS = 90_000;
 
 export async function generateAiAnswers(fields, profile, page, jobHash, warnings, logContext = {}) {
+  if (!OPENAI_ROUTE_ENABLED) {
+    warnings.push("OpenAI autofill routing is disabled.");
+    logBackendEvent("OPENAI_SKIPPED", {
+      job_id: logContext.jobId || null,
+      reason: "route-disabled",
+      fields: fields.length
+    }, { requestId: logContext.requestId });
+    return [];
+  }
+
   const payload = buildAiPayload(fields, profile, page, jobHash);
   const model = OPENAI_MODEL;
 
@@ -147,6 +160,7 @@ function normalizeAiResponse(parsed, fields, route, warnings) {
   return Array.isArray(parsed?.answers)
     ? parsed.answers
       .filter((answer) => fieldIds.has(answer.field_id) && typeof answer.value === "string" && answer.value.trim())
+      .filter((answer) => !isRejectedAiPlaceholder(answer.value))
       .map((answer) => ({
         field_id: String(answer.field_id),
         value: String(answer.value),
@@ -158,6 +172,11 @@ function normalizeAiResponse(parsed, fields, route, warnings) {
         estimated_request_cost_usd: route.estimated_request_cost_usd
       }))
     : [];
+}
+
+function isRejectedAiPlaceholder(value) {
+  return /^(?:not specified|unspecified|unknown|not provided|not available|no information(?: provided| available)?|information unavailable|to be determined|tbd)$/i
+    .test(String(value || "").trim());
 }
 
 function openAiAnswerSchema() {

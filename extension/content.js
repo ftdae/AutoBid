@@ -45,12 +45,14 @@ const SHEET_ANSWER_RETRY_ATTEMPTS = 3;
 const SHEET_ANSWER_RETRY_MS = 10000;
 const RUNTIME_GPT_ANSWER_TIMEOUT_MS = 90000;
 const RUNTIME_GPT_ANSWER_POLL_MS = 1000;
+const OPENAI_AUTOFILL_ROUTE_ENABLED = false;
 const SHEET_CONTEXT_TIMEOUT_MS = 5000;
 const RESUME_ATTACH_TIMEOUT_MS = 30000;
 const RESUME_FILE_INPUT_WAIT_MS = 2500;
 const RESUME_FILE_INPUT_RETRY_MS = 250;
 const RESUME_SERVER_CONFIRM_TIMEOUT_MS = 6000;
-const CHOICE_FIELD_TYPES = ["select", "radio", "combobox", "button-group"];
+const RESUME_MANAGED_UPLOAD_TIMEOUT_MS = 30000;
+const CHOICE_FIELD_TYPES = ["select", "radio", "checkbox", "combobox", "button-group"];
 const PHONE_DIAL_CODES_BY_COUNTRY = {
   albania: "+355",
   austria: "+43",
@@ -91,7 +93,7 @@ const PHONE_DIAL_CODES_BY_COUNTRY = {
   usa: "+1"
 };
 const LANGUAGE_ALIASES = [
-  ["english", ["english"]],
+  ["english", ["english", "inglese"]],
   ["ukrainian", ["ukrainian"]],
   ["polish", ["polish"]],
   ["russian", ["russian"]],
@@ -99,7 +101,7 @@ const LANGUAGE_ALIASES = [
   ["portuguese", ["portuguese"]],
   ["german", ["german"]],
   ["french", ["french"]],
-  ["italian", ["italian"]],
+  ["italian", ["italian", "italiano"]],
   ["dutch", ["dutch"]],
   ["croatian", ["croatian"]],
   ["czech", ["czech"]],
@@ -236,7 +238,10 @@ async function runAutoBid() {
     const locallyFilledIds = new Set([...initiallyFilledIds, ...staticFallbackResult.filledIds]);
     const localFallbackResult = await runStep("local-fallbacks", () => applyLocalGeneratedFallbacks(fields, locallyFilledIds), emptyFillResult());
     fields = collectFields();
-    const localAnswerIds = getCurrentlyFilledFieldIds(fields);
+    const localAnswerIds = new Set([
+      ...getCurrentlyFilledFieldIds(fields),
+      ...localFallbackResult.filledIds
+    ]);
     traceAutoBid("fields:refreshed-after-local", {
       count: fields.length,
       filled: localAnswerIds.size
@@ -245,7 +250,8 @@ async function runAutoBid() {
 
     traceAutoBid("ai:router-order", {
       first: "chatgpt-extension",
-      second: "openai",
+      second: null,
+      openai_enabled: OPENAI_AUTOFILL_ROUTE_ENABLED,
       candidates: getGeneratedAnswerCandidateFields(fields, localAnswerIds).length
     });
     const runtimeGptResult = await runStep(
@@ -261,11 +267,18 @@ async function runAutoBid() {
       chatgpt_filled: runtimeGptResult.filled,
       chatgpt_pending: runtimeGptResult.pending
     });
-    const openAiResult = await runStep(
-      "openai-second-provider",
-      () => applyDirectAiAnswers(fields, afterRuntimeGptIds),
-      emptyFillResult()
-    );
+    const openAiResult = OPENAI_AUTOFILL_ROUTE_ENABLED
+      ? await runStep(
+        "openai-second-provider",
+        () => applyDirectAiAnswers(fields, afterRuntimeGptIds),
+        emptyFillResult()
+      )
+      : emptyFillResult();
+    if (!OPENAI_AUTOFILL_ROUTE_ENABLED) {
+      traceAutoBid("ai:openai-route-disabled", {
+        unresolved_required: getMissingRequiredFields(fields).length
+      });
+    }
     fields = collectFields();
     traceAutoBid("fields:refreshed-after-openai", {
       count: fields.length,
@@ -284,7 +297,14 @@ async function runAutoBid() {
     const runtimeGptReconcileResult = emptyFillResult();
     fields = collectFields();
     const finalDefaultIds = getCurrentlyFilledFieldIds(fields);
-    const finalDefaultResult = await runStep("final-deterministic-defaults", () => applyDeterministicDefaults(fields, finalDefaultIds), emptyFillResult());
+    const finalDefaultResult = await runStep(
+      "final-deterministic-defaults",
+      () => applyDeterministicDefaults(
+        fields.filter((field) => !shouldDeferChoiceFieldToRuntimeGpt(field)),
+        finalDefaultIds
+      ),
+      emptyFillResult()
+    );
     const submitResult = await maybeAutoSubmitApplication(fields, {
       filled: runtimeGptResult.filled + openAiResult.filled + finalDefaultResult.filled,
       pending: runtimeGptResult.pending
@@ -375,13 +395,68 @@ async function applyLocalGeneratedFallbacks(fields, filledIds) {
   await runLocalPass("language-choice", applyLanguageChoiceAnswers);
   await runLocalPass("outlook-verification", applyOutlookVerificationAnswers);
   await runLocalPass("based-in-location", (items, ids) => applyBasedInLocationAnswers(items, [], ids));
+  await runLocalPass("sensitive-demographic-decline", applySensitiveDemographicDeclineAnswers);
   await runLocalPass("referral-source", applyReferralSourceAnswers);
   await runLocalPass("consent-choice", applyConsentChoiceAnswers);
-  await runLocalPass("deterministic-defaults", applyDeterministicDefaults);
+  await runLocalPass("explicit-not-applicable", applyExplicitNotApplicableAnswers);
+  await runLocalPass("deterministic-defaults", (items, ids) => applyDeterministicDefaults(
+    items.filter((field) => !shouldDeferChoiceFieldToRuntimeGpt(field)),
+    ids
+  ));
   await runLocalPass("positive-dropdowns", applyPositiveDropdownFallbacks);
   await runLocalPass("positive-checkboxes", applyPositiveCheckboxFallbacks);
 
   return { filled, missed, filledIds: localFilledIds };
+}
+
+async function applyExplicitNotApplicableAnswers(fields, filledIds) {
+  const filledLocalIds = new Set();
+  let filled = 0;
+  let missed = 0;
+
+  for (const field of fields) {
+    if (filledIds.has(field.id) || !field.required || !["text", "search", "textarea"].includes(field.type)) continue;
+    const controls = getControlsByFieldId(field.id);
+    if (controls.length === 0 || hasFieldCurrentValue(field, controls)) continue;
+
+    const instructions = normalize([
+      field.question,
+      field.label,
+      field.placeholder,
+      getDescribedByText(controls[0]),
+      getNearbyText(controls[0])
+    ].filter(Boolean).join(" "));
+    if (!explicitlyAllowsNotApplicable(instructions)) continue;
+
+    const answer = /\banswer n a\b|\brespond n a\b|\benter n a\b|\bwrite n a\b/.test(instructions)
+      ? "N/A"
+      : "Not applicable";
+    const selected = await setControlsValue(controls, answer, field);
+    traceAutoBid("explicit-not-applicable:result", {
+      field_id: field.id,
+      label: field.question || field.label,
+      answer,
+      selected,
+      current: getCurrentChoiceSummary(controls)
+    });
+    if (selected) {
+      filled += 1;
+      filledLocalIds.add(field.id);
+    } else {
+      missed += 1;
+    }
+  }
+
+  return { filled, missed, filledIds: filledLocalIds };
+}
+
+function explicitlyAllowsNotApplicable(text) {
+  const value = normalize(text);
+  if (!value) return false;
+  const sentinel = /\b(n a|not applicable)\b/;
+  const conditional = /\b(if not|if no|if none|if you (?:were|are|have|do|did) not|if you (?:haven t|don t|didn t)|if you answered no|otherwise)\b/;
+  const instruction = /\b(answer|respond|enter|write|put|use|please answer|please enter)\b/;
+  return sentinel.test(value) && conditional.test(value) && instruction.test(value);
 }
 
 async function applyOutlookVerificationAnswers(fields, filledIds) {
@@ -551,7 +626,8 @@ function collectFields() {
 
     const id = `ab_${index}_${hashSmall(getFieldText(control))}`;
     const label = getFieldLabel(control);
-    const question = getPlainQuestionText(type === "checkbox" ? getChoiceQuestionLabel(control) || label : label);
+    const choiceQuestionLabel = type === "checkbox" ? getChoiceQuestionLabel(control) : "";
+    const question = getPlainQuestionText(choiceQuestionLabel || label);
     const option = type === "checkbox" ? getCheckboxOptionLabel(control, question) : "";
     control.dataset.autoBidFieldId = id;
     fields.push({
@@ -563,7 +639,7 @@ function collectFields() {
       placeholder: control.getAttribute("placeholder") || "",
       autocomplete: control.getAttribute("autocomplete") || "",
       type,
-      required: isRequired(control),
+      required: isRequired(control) || Boolean(choiceQuestionLabel && /\*/.test(choiceQuestionLabel)),
       options: getControlOptions(control),
       value: getControlValue(control)
     });
@@ -611,6 +687,11 @@ function getFormControls() {
     "[data-radix-select-trigger]",
     "[data-slot='select-trigger']",
     ".select__control",
+    ".fab-SelectToggle",
+    "[data-fabric-component='SelectToggle']",
+    ".select2-selection",
+    ".select2-choice",
+    ".chosen-single",
     "[class*='select'][aria-expanded]",
     ...(atsAdapters?.getControlSelectors?.() || [])
   ])).join(","));
@@ -946,7 +1027,8 @@ function getControlType(control) {
     ["listbox", "menu"].includes(control.getAttribute("aria-haspopup") || "") ||
     control.hasAttribute("data-radix-select-trigger") ||
     control.getAttribute("data-slot") === "select-trigger" ||
-    control.classList?.contains("select__control")
+    control.classList?.contains("select__control") ||
+    control.matches?.(".fab-Select__control, [class*='Select__control'], .fab-SelectToggle, [data-fabric-component='SelectToggle'], .select2-selection, .select2-choice, .chosen-single")
   ) return "combobox";
   if (control.tagName === "TEXTAREA") return "textarea";
   if (control.tagName === "SELECT") return "select";
@@ -1001,7 +1083,7 @@ function isRequired(control) {
   ].filter(Boolean);
   const requiredText = [
     getFieldLabel(control),
-    getNearbyText(control),
+    ["checkbox", "radio"].includes(getControlType(control)) ? getChoiceQuestionLabel(control) : "",
     getDescribedByText(control)
   ].join(" ");
   return Boolean(
@@ -1028,6 +1110,8 @@ function hasRequiredSemanticMarker(element) {
   ].filter(Boolean).join(" ").toLowerCase();
 
   if (/(^|[^a-z])required([^a-z]|$)/.test(markerText) && !/(not-required|optional)/.test(markerText)) return true;
+  const nestedControls = element.querySelectorAll?.("input, textarea, select, [role='checkbox'], [role='radio'], [role='combobox']")?.length || 0;
+  if (nestedControls > 1 && !element.matches?.("label, legend, [class*='label' i]")) return false;
   return /\*/.test(cleanLabel(element.textContent || ""));
 }
 
@@ -1490,8 +1574,8 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
       });
     }
 
-    const alreadyFilled = hasFieldCurrentValue(field, controls);
-    if (alreadyFilled) {
+    const answerAlreadyMatches = doesGeneratedAnswerMatchField(answer, field, controls);
+    if (answerAlreadyMatches) {
       traceAutoBid("answer:skipped-filled", {
         field_id: field.id,
         requested_field_id: requestedFieldId,
@@ -1502,6 +1586,31 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
       filledIds.add(requestedFieldId);
       filledIds.add(field.id);
       continue;
+    }
+
+    const alreadyFilled = hasFieldCurrentValue(field, controls);
+    if (alreadyFilled && !isGeneratedAnswerChoiceField(field)) {
+      traceAutoBid("answer:skipped-filled", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
+        answer: answer.value || "",
+        source: answer.source || "",
+        current: getCurrentChoiceSummary(controls),
+        reason: "preserve-existing-non-choice-value"
+      });
+      filledIds.add(requestedFieldId);
+      filledIds.add(field.id);
+      continue;
+    }
+
+    if (alreadyFilled) {
+      traceAutoBid("answer:replacing-mismatched-choice", {
+        field_id: field.id,
+        requested_field_id: requestedFieldId,
+        answer: answer.value || "",
+        source: answer.source || "",
+        current: getCurrentChoiceSummary(controls)
+      });
     }
 
     const previousAttempts = getGeneratedAnswerFillAttempts(attemptKey);
@@ -1541,7 +1650,14 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
     }
 
     const valueToApply = declaredChoice?.text || declaredChoice?.value || answer.value || "";
-    if (await setControlsValue(controls, valueToApply, field)) {
+    const selected = await setControlsValue(controls, valueToApply, field);
+    const verified = selected && await waitForGeneratedAnswerMatch({
+      ...answer,
+      field_id: field.id,
+      value: valueToApply
+    }, field, controls);
+    if (verified) {
+      generatedAnswerFillAttempts.delete(attemptKey);
       traceAutoBid("answer:applied", {
         field_id: field.id,
         requested_field_id: requestedFieldId,
@@ -1555,11 +1671,13 @@ async function applyAnswers(answers, skipFilledIds = new Set(), fields = []) {
       filledIds.add(field.id);
     } else {
       const attempt = recordGeneratedAnswerFillFailure(attemptKey);
-      traceAutoBid("answer:missed", {
+      traceAutoBid(selected ? "answer:verification-failed" : "answer:missed", {
         field_id: field.id,
         requested_field_id: requestedFieldId,
         answer: answer.value || "",
         source: answer.source || "",
+        selected,
+        current: getCurrentChoiceSummary(controls),
         attempt,
         max_attempts: MAX_FIELD_FILL_ATTEMPTS,
         stopped: attempt >= MAX_FIELD_FILL_ATTEMPTS
@@ -1712,12 +1830,12 @@ async function applyBasedInLocationAnswers(fields, answers, filledIds) {
   let missed = 0;
 
   for (const field of fields) {
-    if (filledIds.has(field.id) || !isBasedInLocationField(field) || !isChoiceFieldType(field.type)) continue;
+    if (filledIds.has(field.id) || !isBasedInLocationField(field) || !isSemanticBooleanFieldType(field.type)) continue;
 
     const controls = getControlsByFieldId(field.id);
     if (controls.length === 0 || hasCurrentChoiceValue(controls)) continue;
 
-    const answer = locationAnswerMatchesQuestion(locationAnswer, field.label) ? "Yes" : "No";
+    const answer = locationAnswerMatchesQuestion(locationAnswer, field.question || field.label) ? "Yes" : "No";
     if (await setControlsValue(controls, answer)) {
       filled += 1;
       filledLocalIds.add(field.id);
@@ -1742,10 +1860,97 @@ async function applyBasedInLocationAnswers(fields, answers, filledIds) {
   return { filled, missed, filledIds: filledLocalIds };
 }
 
+async function applySensitiveDemographicDeclineAnswers(fields, filledIds) {
+  const filledLocalIds = new Set();
+  let filled = 0;
+  let missed = 0;
+
+  for (const field of fields) {
+    if (filledIds.has(field.id) || !field.required || !isSensitiveDemographicChoiceField(field)) continue;
+
+    const controls = getControlsByFieldId(field.id);
+    if (controls.length === 0 || hasCurrentChoiceValue(controls)) continue;
+
+    let options = field.options || [];
+    if (field.type === "combobox" && options.length === 0) {
+      options = (await getComboboxChoices(controls[0])).map((option) => cleanLabel(
+        option.textContent || option.getAttribute("data-value") || option.getAttribute("value") || ""
+      ));
+      field.options = uniqueNonEmptyValues(options);
+      await closeCombobox(controls[0]);
+    }
+
+    const answer = findSensitiveDemographicDeclineOption(options);
+    if (!answer) {
+      traceAutoBid("sensitive-demographic:no-decline-option", {
+        field_id: field.id,
+        label: field.label,
+        options
+      });
+      continue;
+    }
+
+    const selected = await setControlsValue(controls, answer, field);
+    traceAutoBid("sensitive-demographic:decline-result", {
+      field_id: field.id,
+      label: field.label,
+      answer,
+      selected,
+      current: getCurrentChoiceSummary(controls)
+    });
+    if (selected) {
+      filled += 1;
+      filledLocalIds.add(field.id);
+    } else {
+      missed += 1;
+    }
+  }
+
+  return { filled, missed, filledIds: filledLocalIds };
+}
+
+function isSensitiveDemographicChoiceField(field) {
+  if (!field || !isChoiceFieldType(field.type)) return false;
+  const text = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  return /(gender|race|ethnicity|ethnic|disability|veteran|protected veteran|sexual orientation|pronoun)/.test(text);
+}
+
+function findSensitiveDemographicDeclineOption(options) {
+  const choices = (options || [])
+    .map((option) => String(option || "").trim())
+    .filter(Boolean)
+    .map((option, index) => ({ option, score: scoreSensitiveDemographicDeclineOption(option, index) }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  return choices[0]?.option || "";
+}
+
+function scoreSensitiveDemographicDeclineOption(option, index) {
+  const text = normalize(option);
+  if (!text || isPlaceholderChoice(text, text)) return -100;
+  let score = 0;
+  if (/(prefer|choose|wish|want).{0,30}not.{0,30}(say|answer|disclose|identify|respond)/.test(text)) score += 500;
+  if (/(decline|do not wish|don t wish|not disclosed|rather not|no answer)/.test(text)) score += 420;
+  if (/(prefer not to say|prefer not to answer|decline to self identify)/.test(text)) score += 300;
+  return score > 0 ? score + Math.max(0, 20 - index) : 0;
+}
+
+function isSemanticBooleanFieldType(type) {
+  return isChoiceFieldType(type) || ["text", "search", "textarea"].includes(type);
+}
+
 async function applyLanguageChoiceAnswers(fields, filledIds) {
   const filledLocalIds = new Set();
   let filled = 0;
   let missed = 0;
+  let knownLanguages = [];
+
+  try {
+    const profile = await send("GET_PROFILE_STATIC_FIELDS");
+    knownLanguages = getProfileLanguages(profile?.static_fields || {});
+  } catch (error) {
+    traceAutoBid("language-choice:profile-unavailable", { message: error.message || String(error) });
+  }
 
   for (const field of fields) {
     if (!isLanguageChoiceField(field)) continue;
@@ -1753,8 +1958,8 @@ async function applyLanguageChoiceAnswers(fields, filledIds) {
     const controls = getControlsByFieldId(field.id);
     if (controls.length === 0) continue;
 
-    const questionLanguages = getQuestionLanguageAliases(field.label);
-    const answer = getLanguageChoiceAnswer(field, questionLanguages);
+    const questionLanguages = getQuestionLanguageAliases(field.question || field.label);
+    const answer = getLanguageChoiceAnswer(field, questionLanguages, knownLanguages);
     if (!answer) continue;
 
     const current = getCurrentChoiceSummary(controls);
@@ -1910,7 +2115,11 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
   const matched = [];
   const missing = [];
 
-  for (const field of fields) {
+  const orderedFields = [...fields].sort((left, right) =>
+    getProfileAddressFillPriority(left) - getProfileAddressFillPriority(right)
+  );
+
+  for (const field of orderedFields) {
     if (filledIds.has(field.id)) continue;
     const key = matchProfileStaticFieldKey(field);
     if (!key) continue;
@@ -1940,7 +2149,7 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
 
       const selected = await setControlsValue(controls, value, field, {
         country: getProfileStaticValue(staticFields, "country"),
-        locationCountryFirst: ["country", "location", "city"].includes(key),
+        locationCountryFirst: ["country", "location", "city", "state_region"].includes(key),
         profileKey: key
       });
       traceAutoBid("profile-static:attempt", {
@@ -1968,6 +2177,7 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
         value: shortText(appliedValue),
         current: getCurrentChoiceSummary(controls)
       });
+      if (key === "country") await sleep(350);
     } else {
       missed += 1;
       traceAutoBid("profile-static:missed", {
@@ -1989,6 +2199,13 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
   });
 
   return { filled, missed, filledIds: filledLocalIds };
+}
+
+function getProfileAddressFillPriority(field) {
+  const key = matchProfileStaticFieldKey(field);
+  if (key === "country") return 0;
+  if (key === "state_region") return 1;
+  return 2;
 }
 
 async function applyPhoneDialCodeSelectors(staticFields) {
@@ -2076,13 +2293,52 @@ function getDialCodeForCountry(country) {
 
 async function attachResumeFromSheet() {
   let inputs = getResumeFileInputs();
-  if (inputs.every((input) => input.files?.length) && inputs.length > 0) {
+  if (inputs.length > 0 && inputs.every((input) => isResumeInputAttached(input))) {
     traceAutoBid("resume:already-attached", {
       files: inputs.flatMap(getResumeInputAttachedFilenames),
       server_confirmed: inputs.some(hasServerConfirmedResumeUpload),
-      reason: "browser-file-input-populated"
+      reason: "upload-confirmed"
     });
     return { filled: 0, missed: 0, reason: "already-attached" };
+  }
+
+  const existingManagedAttempt = inputs
+    .map((input) => ({
+      input,
+      filename: input.files?.[0]?.name || "",
+      context: getManagedResumeUploadContext(input)
+    }))
+    .map((attempt) => ({
+      ...attempt,
+      status: getManagedResumeUploadStatus(attempt.context, attempt.filename)
+    }))
+    .find((attempt) => attempt.filename && attempt.context.managed && attempt.status.status !== "complete");
+
+  if (existingManagedAttempt) {
+    let attached = false;
+    if (["pending", "uploading"].includes(existingManagedAttempt.status.status)) {
+      attached = await waitForResumeInputConfirmation(
+        existingManagedAttempt.input,
+        existingManagedAttempt.filename,
+        RESUME_MANAGED_UPLOAD_TIMEOUT_MS,
+        getResumeServerConfirmationSnapshot(existingManagedAttempt.input),
+        existingManagedAttempt.context
+      );
+    }
+    const finalStatus = getManagedResumeUploadStatus(
+      existingManagedAttempt.context,
+      existingManagedAttempt.filename
+    );
+    traceAutoBid("resume:managed-upload-resumed", {
+      attached,
+      filename: existingManagedAttempt.filename,
+      previous_status: existingManagedAttempt.status.status,
+      final_status: finalStatus.status,
+      message: finalStatus.message || existingManagedAttempt.status.message || ""
+    });
+    return attached
+      ? { filled: 0, missed: 0, filename: existingManagedAttempt.filename, reason: "existing-upload-completed" }
+      : { filled: 0, missed: 1, filename: existingManagedAttempt.filename, reason: "existing-managed-upload-failed" };
   }
 
   let payload;
@@ -2136,14 +2392,6 @@ async function attachResumeFromSheet() {
     else missed += 1;
   }
 
-  if (filled === 0 && !chooserResult?.attempted) {
-    chooserResult = await attachResumeViaNativeFileChooser(file, payload);
-    traceAutoBid("resume:file-chooser-upload", chooserResult);
-    if (chooserResult.attached) {
-      return { filled: 1, missed: 0, filename: file.name, method: "file-chooser" };
-    }
-  }
-
   if (inputs.length === 0) {
     traceAutoBid("resume:no-input", {
       candidates: getFileInputCandidatesDebug(),
@@ -2163,8 +2411,8 @@ function fetchResumePayload(inputs) {
 }
 
 async function attachResumeViaNativeFileChooser(file, payload = {}) {
-  const localPath = String(payload.local_path || payload.localPath || "").trim();
-  if (!localPath) return { attempted: false, attached: false, reason: "no-local-path" };
+  const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "");
+  if (!base64) return { attempted: false, attached: false, reason: "no-file-bytes" };
 
   const button = findResumeAttachButton();
   if (!button) return { attempted: false, attached: false, reason: "attach-button-not-found" };
@@ -2183,8 +2431,9 @@ async function attachResumeViaNativeFileChooser(file, payload = {}) {
     const result = await send("NATIVE_FILE_CHOOSER_UPLOAD", {
       x,
       y,
-      local_path: localPath,
-      filename: file.name
+      filename: file.name,
+      mime_type: file.type || payload.mime_type || payload.mimeType || "application/pdf",
+      base64
     });
     await sleep(900);
     const attached = await waitForAnyResumeUploadConfirmation(
@@ -2304,6 +2553,9 @@ function scoreResumeAttachButton(text, context) {
 function getResumeFileInputs() {
   const inputs = queryAll("input[type='file']")
     .filter((input) => !input.disabled);
+  const teamtailorInputs = getTeamtailorResumeFileInputs(inputs);
+  if (teamtailorInputs.length > 0) return teamtailorInputs;
+
   const scored = inputs
     .map((input) => ({
       input,
@@ -2313,6 +2565,12 @@ function getResumeFileInputs() {
     .filter((candidate) => candidate.score > -100)
     .sort((left, right) => right.score - left.score);
 
+  const requiredInputs = scored
+    .filter((candidate) => candidate.input.required || candidate.input.getAttribute("aria-required") === "true")
+    .filter((candidate) => candidate.score >= 90)
+    .map((candidate) => candidate.input);
+  if (requiredInputs.length === 1) return requiredInputs;
+
   const resumeInputs = scored
     .filter((candidate) => candidate.score >= 90)
     .map((candidate) => candidate.input);
@@ -2321,7 +2579,77 @@ function getResumeFileInputs() {
   const nonCoverLetterInputs = scored
     .filter((candidate) => !isCoverLetterFileText(candidate.context))
     .map((candidate) => candidate.input);
-  return nonCoverLetterInputs.length === 1 ? nonCoverLetterInputs : [];
+  if (nonCoverLetterInputs.length === 1) return nonCoverLetterInputs;
+
+  return getBambooResumeFileInputFallback(inputs);
+}
+
+function getTeamtailorResumeFileInputs(inputs) {
+  const uploadRoots = queryAll("[data-controller~='forms--inputs--upload']");
+  const resumeRoot = uploadRoots.find((element) => {
+    const text = normalize([element.id, element.textContent].filter(Boolean).join(" "));
+    const required = element.getAttribute("data-forms--inputs--upload-required-value") === "true";
+    return required && /\b(resume|cv|curriculum vitae)\b/.test(text) && !isCoverLetterFileText(text);
+  });
+  if (!resumeRoot) return [];
+
+  const directInput = queryAll("input[type='file']", resumeRoot).find((input) => !input.disabled);
+  if (directInput) return [directInput];
+
+  const dropzoneInputs = inputs.filter((input) => input.matches?.(".dz-hidden-input"));
+  if (dropzoneInputs.length === 0) return [];
+
+  const expectedAccept = normalizeFileAccept(
+    resumeRoot.getAttribute("data-forms--inputs--upload-accepted-files-value") || ""
+  );
+  if (expectedAccept) {
+    const acceptMatches = dropzoneInputs.filter((input) => normalizeFileAccept(input.accept || "") === expectedAccept);
+    if (acceptMatches.length === 1) return acceptMatches;
+  }
+
+  const documentInputs = dropzoneInputs.filter(acceptsResumeDocument);
+  if (documentInputs.length === 1) return documentInputs;
+
+  const rootIndex = uploadRoots.indexOf(resumeRoot);
+  if (rootIndex >= 0 && uploadRoots.length === dropzoneInputs.length && dropzoneInputs[rootIndex]) {
+    return [dropzoneInputs[rootIndex]];
+  }
+  return [];
+}
+
+function normalizeFileAccept(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(",");
+}
+
+function getBambooResumeFileInputFallback(inputs) {
+  if (atsAdapters?.describe?.().id !== "bamboohr" || inputs.length === 0) return [];
+
+  const uploadLabels = queryAll([
+    ".fab-FormRow__label",
+    ".fab-Label",
+    "label",
+    "legend",
+    "[class*='label' i]"
+  ].join(","))
+    .filter(isVisible)
+    .map((element) => ({ element, text: normalize(element.textContent || "") }))
+    .filter(({ text }) => /^(cover letter|resume|cv|curriculum vitae)( required| optional)?$/.test(text))
+    .filter((candidate, index, items) => items.findIndex((item) => item.element === candidate.element) === index);
+  const resumeIndex = uploadLabels.findIndex(({ text }) => /^(resume|cv|curriculum vitae)/.test(text));
+  if (resumeIndex < 0 || resumeIndex >= inputs.length || uploadLabels.length > inputs.length) return [];
+
+  const input = inputs[resumeIndex];
+  traceAutoBid("resume:bamboo-input-mapped", {
+    input_index: resumeIndex,
+    input_count: inputs.length,
+    upload_labels: uploadLabels.map(({ text }) => text)
+  });
+  return [input];
 }
 
 function isResumeFileInput(input) {
@@ -2346,6 +2674,8 @@ function scoreResumeFileInput(input) {
   if (isCoverLetterFileText(text) || isCoverLetterFileText(attributes)) return -1000;
 
   let score = 0;
+  if (atsAdapters?.describe?.().id === "bamboohr" &&
+      (input.required || input.getAttribute("aria-required") === "true")) score += 125;
   if (uploadZone && !isCoverLetterFileText(uploadZoneText)) score += 110;
   if (/\b(resume|cv|curriculum vitae)\b/.test(text)) score += 120;
   if (/\b(resume|cv|curriculum vitae)\b/.test(attributes)) score += 100;
@@ -2403,6 +2733,7 @@ function getFileInputContextText(input) {
     input.name,
     input.id,
     container?.textContent,
+    getFieldContainer(input)?.textContent,
     getAssociatedResumeUploadZone(input)?.textContent,
     getFileInputAncestorLabelCandidates(input).join(" "),
     getSiblingLabelCandidates(input).join(" ")
@@ -2584,40 +2915,49 @@ function sanitizeFilename(value) {
 
 async function setFileInputValue(input, file, payload = {}) {
   try {
+    const pageResult = await setFileInputValueInPage(input, file, payload);
+    if (pageResult.attempted) {
+      traceAutoBid("resume:page-upload", {
+        attached: pageResult.attached,
+        server_confirmed: pageResult.server_confirmed,
+        managed_status: pageResult.managed_status || "",
+        filename: file.name
+      });
+    }
+    if (pageResult.attached) return true;
+    // Once a page accepted a file-selection event, retrying through CDP, drop,
+    // or a file chooser can enqueue the same File again. A rejected/timed-out
+    // managed upload is a real failure, not permission to submit a duplicate.
+    if (pageResult.attempted) return false;
+
     const nativeResult = await setFileInputValueNatively(input, file, payload);
     if (nativeResult.attempted) {
       traceAutoBid("resume:native-upload", {
         uploaded: nativeResult.uploaded,
         attached: nativeResult.attached,
         server_confirmed: nativeResult.server_confirmed,
+        managed_status: nativeResult.managed_status || "",
         files: nativeResult.files,
         reason: nativeResult.reason || "",
-        filename: file.name
+        filename: file.name,
+        transport: "bytes"
       });
     }
     if (nativeResult.attached) return true;
-
-    const pageResult = await setFileInputValueInPage(input, file, payload);
-    if (pageResult.attempted) {
-      traceAutoBid("resume:page-upload", {
-        attached: pageResult.attached,
-        server_confirmed: pageResult.server_confirmed,
-        filename: file.name
-      });
-    }
-    if (pageResult.attached) return true;
+    if (nativeResult.attempted) return false;
 
     const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+    const uploadContext = getManagedResumeUploadContext(input);
     const transfer = new DataTransfer();
     transfer.items.add(file);
     input.files = transfer.files;
     dispatchFileInputEvents(input, transfer);
-    dispatchFileDropEvents(input, transfer);
     return waitForResumeInputConfirmation(
       input,
       file.name,
       RESUME_SERVER_CONFIRM_TIMEOUT_MS,
-      confirmationBefore
+      confirmationBefore,
+      uploadContext
     );
   } catch (error) {
     traceAutoBid("resume:set-file-error", { message: error.message || String(error) });
@@ -2626,30 +2966,35 @@ async function setFileInputValue(input, file, payload = {}) {
 }
 
 async function setFileInputValueNatively(input, file, payload) {
-  const localPath = String(payload.local_path || payload.localPath || "").trim();
-  if (!localPath) return { attempted: false, attached: false, reason: "no-local-path" };
+  const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "");
+  if (!base64) return { attempted: false, attached: false, reason: "no-file-bytes" };
 
   const token = `ab_file_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+  const uploadContext = getManagedResumeUploadContext(input);
   input.setAttribute("data-auto-bid-native-file-token", token);
   try {
     const result = await send("NATIVE_FILE_UPLOAD", {
       token,
-      local_path: localPath,
-      filename: file.name
+      filename: file.name,
+      mime_type: file.type || payload.mime_type || payload.mimeType || "application/pdf",
+      base64
     });
     const attached = await waitForResumeInputConfirmation(
       input,
       file.name,
       RESUME_SERVER_CONFIRM_TIMEOUT_MS,
-      confirmationBefore
+      confirmationBefore,
+      uploadContext
     );
+    const managedStatus = getManagedResumeUploadStatus(uploadContext, file.name);
     return {
       attempted: true,
       uploaded: Boolean(result?.uploaded),
       files: Number(result?.files || input.files?.length || 0),
       attached,
-      server_confirmed: attached && isServerTrackedResumeInput(input)
+      server_confirmed: attached && isServerTrackedResumeInput(input),
+      managed_status: managedStatus.status
     };
   } catch (error) {
     return {
@@ -2676,6 +3021,7 @@ async function setFileInputValueInPage(input, file, payload) {
   if (!filePayload.base64) return { attempted: false, attached: false };
 
   const confirmationBefore = getResumeUploadComponentFileMetadata(input);
+  const uploadContext = getManagedResumeUploadContext(input);
   const acknowledged = runPageCommand("file-upload", input, { file: filePayload });
   if (!acknowledged) return { attempted: false, attached: false };
 
@@ -2683,58 +3029,27 @@ async function setFileInputValueInPage(input, file, payload) {
     input,
     file.name,
     RESUME_SERVER_CONFIRM_TIMEOUT_MS,
-    confirmationBefore
+    confirmationBefore,
+    uploadContext
   );
+  const managedStatus = getManagedResumeUploadStatus(uploadContext, file.name);
   return {
     attempted: true,
     attached,
-    server_confirmed: attached && isServerTrackedResumeInput(input)
+    server_confirmed: attached && isServerTrackedResumeInput(input),
+    managed_status: managedStatus.status
   };
 }
 
 function dispatchFileInputEvents(input, transfer) {
   input.focus?.();
-  ["input", "change"].forEach((type) => {
+  const eventTypes = getManagedResumeUploadContext(input).managed ? ["change"] : ["input", "change"];
+  eventTypes.forEach((type) => {
     const event = new Event(type, { bubbles: true, cancelable: true, composed: true });
     defineEventDataTransfer(event, transfer);
     input.dispatchEvent(event);
   });
   input.blur?.();
-}
-
-function dispatchFileDropEvents(input, transfer) {
-  const targets = getFileDropTargets(input);
-  targets.forEach((target) => {
-    ["dragenter", "dragover", "drop"].forEach((type) => {
-      const event = createDragEvent(type, transfer);
-      target.dispatchEvent(event);
-    });
-  });
-}
-
-function getFileDropTargets(input) {
-  return Array.from(new Set([
-    getAssociatedResumeUploadZone(input),
-    getFileInputContextContainer(input),
-    input.closest?.("label"),
-    input.parentElement,
-    input
-  ].filter(Boolean)));
-}
-
-function createDragEvent(type, transfer) {
-  try {
-    return new DragEvent(type, {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      dataTransfer: transfer
-    });
-  } catch {
-    const event = new Event(type, { bubbles: true, cancelable: true, composed: true });
-    defineEventDataTransfer(event, transfer);
-    return event;
-  }
 }
 
 function defineEventDataTransfer(event, transfer) {
@@ -2772,17 +3087,33 @@ function hasResumeUploadedUi(filename) {
 function isResumeInputAttached(input) {
   if (!input) return false;
   if (hasServerConfirmedResumeUpload(input)) return true;
+  const managedStatus = getManagedResumeUploadStatus(getManagedResumeUploadContext(input), input.files?.[0]?.name || "");
+  if (managedStatus.managed) return managedStatus.status === "complete";
   if (isServerTrackedResumeInput(input)) return false;
   return Boolean(input.files?.length) || hasUploadedFileUi(input, input.files?.[0]?.name || "");
 }
 
-async function waitForResumeInputConfirmation(input, filename, timeoutMs, confirmationBefore = []) {
+async function waitForResumeInputConfirmation(input, filename, timeoutMs, confirmationBefore = [], uploadContext = null) {
   const requiresServerConfirmation = isServerTrackedResumeInput(input);
+  const managedContext = uploadContext || getManagedResumeUploadContext(input);
+  const waitTimeoutMs = managedContext.managed
+    ? Math.max(timeoutMs, RESUME_MANAGED_UPLOAD_TIMEOUT_MS)
+    : timeoutMs;
   const started = Date.now();
 
-  while (Date.now() - started < timeoutMs) {
+  while (Date.now() - started < waitTimeoutMs) {
     if (hasNewServerConfirmedResumeUpload(input, filename, confirmationBefore)) return true;
+    const managedStatus = getManagedResumeUploadStatus(managedContext, filename);
+    if (managedStatus.status === "complete") return true;
+    if (managedStatus.status === "failed") {
+      traceAutoBid("resume:managed-upload-failed", {
+        filename,
+        message: managedStatus.message
+      });
+      return false;
+    }
     if (!requiresServerConfirmation &&
+        !managedContext.managed &&
         (Boolean(input.files?.length) || hasUploadedFileUi(input, filename))) {
       return true;
     }
@@ -2791,6 +3122,7 @@ async function waitForResumeInputConfirmation(input, filename, timeoutMs, confir
 
   return hasNewServerConfirmedResumeUpload(input, filename, confirmationBefore) ||
     !requiresServerConfirmation &&
+      !managedContext.managed &&
       (Boolean(input.files?.length) || hasUploadedFileUi(input, filename));
 }
 
@@ -2798,20 +3130,92 @@ async function waitForAnyResumeUploadConfirmation(filename, nativeUploaded, time
   const started = Date.now();
   let inputs = getResumeFileInputs();
   const serverTracked = inputs.some(isServerTrackedResumeInput) || hasServerTrackedResumeUploadZone();
+  const managedContext = getManagedResumeUploadContext(inputs[0] || null);
+  const waitTimeoutMs = managedContext.managed
+    ? Math.max(timeoutMs, RESUME_MANAGED_UPLOAD_TIMEOUT_MS)
+    : timeoutMs;
 
-  while (Date.now() - started < timeoutMs) {
+  while (Date.now() - started < waitTimeoutMs) {
     inputs = getResumeFileInputs();
     if (hasNewResumeServerConfirmation(filename, confirmationBefore)) {
       return true;
     }
-    if (!serverTracked && inputs.some((input) => isResumeInputAttached(input))) return true;
-    if (!serverTracked && (nativeUploaded || hasResumeUploadedUi(filename))) return true;
+    const managedStatus = getManagedResumeUploadStatus(managedContext, filename);
+    if (managedStatus.status === "complete") return true;
+    if (managedStatus.status === "failed") return false;
+    if (!managedContext.managed && !serverTracked && inputs.some((input) => isResumeInputAttached(input))) return true;
+    if (!managedContext.managed && !serverTracked && (nativeUploaded || hasResumeUploadedUi(filename))) return true;
     await sleep(200);
   }
 
   return hasNewResumeServerConfirmation(filename, confirmationBefore) ||
-    !serverTracked && inputs.some(isResumeInputAttached) ||
-    !serverTracked && (nativeUploaded || hasResumeUploadedUi(filename));
+    !managedContext.managed && !serverTracked && inputs.some(isResumeInputAttached) ||
+    !managedContext.managed && !serverTracked && (nativeUploaded || hasResumeUploadedUi(filename));
+}
+
+function getManagedResumeUploadContext(input) {
+  const root = findTeamtailorResumeUploadRoot(input) ||
+    input?.closest?.(".dropzone, [data-controller~='forms--inputs--upload']") ||
+    null;
+  const managed = Boolean(
+    root ||
+    input?.matches?.(".dz-hidden-input") ||
+    atsAdapters?.describe?.().id === "teamtailor"
+  );
+  return { managed, root };
+}
+
+function findTeamtailorResumeUploadRoot(input) {
+  const direct = input?.closest?.("[data-controller~='forms--inputs--upload']");
+  if (direct && isResumeUploadZoneText(direct.textContent || direct.id || "")) return direct;
+
+  return queryAll("[data-controller~='forms--inputs--upload']")
+    .find((element) => {
+      const text = normalize([element.id, element.textContent].filter(Boolean).join(" "));
+      return /\b(resume|cv|curriculum vitae)\b/.test(text) && !isCoverLetterFileText(text);
+    }) || null;
+}
+
+function getManagedResumeUploadStatus(context, filename = "") {
+  if (!context?.managed) return { managed: false, status: "unmanaged", message: "" };
+  const root = context.root?.isConnected ? context.root : findTeamtailorResumeUploadRoot(null);
+  if (!root) return { managed: true, status: "pending", message: "" };
+
+  const visibleErrors = queryAll(".dz-error, [data-dz-errormessage], [role='alert']", root)
+    .filter(isVisible)
+    .map((element) => cleanLabel(element.textContent || element.getAttribute?.("data-dz-errormessage") || ""))
+    .filter(Boolean);
+  const rootText = cleanLabel(root.textContent || "");
+  const duplicateQueueMessage = /already been processed or was rejected/i.test(rootText);
+  if (visibleErrors.length > 0 || duplicateQueueMessage) {
+    return {
+      managed: true,
+      status: "failed",
+      message: shortText(visibleErrors.join(" ") || rootText)
+    };
+  }
+
+  const urlInputs = queryAll("[data-forms--inputs--upload-preview-target='urlInput']", root);
+  const hasRemoteUrl = urlInputs.some((element) => !element.disabled && Boolean(String(element.value || "").trim()));
+  const visibleName = queryAll("[data-forms--inputs--upload-preview-target='name'], [data-dz-name]", root)
+    .filter(isVisible)
+    .some((element) => {
+      const text = normalize(element.textContent || "");
+      return Boolean(text) && (!filename || text.includes(normalize(filename)));
+    });
+  const dropzoneSucceeded = Boolean(root.querySelector?.(".dz-success:not(.dz-error)"));
+  if (hasRemoteUrl || visibleName || dropzoneSucceeded) {
+    return { managed: true, status: "complete", message: "" };
+  }
+
+  const visibleProgress = queryAll("[data-progress], .dz-progress, [data-dz-uploadprogress]", root)
+    .some(isVisible);
+  const dropzoneProcessing = Boolean(root.querySelector?.(".dz-processing, .dz-uploading, .dz-queued"));
+  if (visibleProgress || dropzoneProcessing || /\buploading\b/i.test(rootText)) {
+    return { managed: true, status: "uploading", message: "" };
+  }
+
+  return { managed: true, status: "pending", message: "" };
 }
 
 function hasServerTrackedResumeUploadZone() {
@@ -3097,6 +3501,23 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
   const context = await getSheetContextForRuntime(page);
 
   const candidateFields = getSheetQuestionCandidateFields(fields, filledIds);
+  traceAutoBid("runtime-gpt:candidates-selected", {
+    candidates: candidateFields.map((field) => ({
+      field_id: field.id,
+      question: field.question || field.label,
+      option: field.option || "",
+      type: field.type
+    })),
+    skipped: fields
+      .map((field) => ({
+        field_id: field.id,
+        question: field.question || field.label,
+        option: field.option || "",
+        type: field.type,
+        reason: getSheetCandidateSkipReason(field, filledIds)
+      }))
+      .filter((field) => field.reason)
+  });
   if (candidateFields.length === 0) {
     traceAutoBid("runtime-gpt:no-candidates", {
       fields: fields.map((field) => ({
@@ -3121,6 +3542,13 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
 
   const profileContext = await getGeneratedAnswerProfileContext();
   const payload = buildSheetQuestionPayload(page, context, remaining, profileContext);
+  traceAutoBid("runtime-gpt:context-quality", {
+    row_number: context.rowNumber || null,
+    match_source: context.matchSource || "",
+    tailored_resume_chars: String(payload.gpt_context?.tailored_resume_content || "").length,
+    job_description_chars: String(payload.gpt_context?.job_description || "").length,
+    profile_static_keys: Object.keys(payload.profile?.static_fields || {}).filter((key) => String(payload.profile.static_fields[key] || "").trim())
+  });
   traceAutoBid("runtime-gpt:request", {
     row_number: context.rowNumber || null,
     sheet_name: context.sheetName || "",
@@ -3260,7 +3688,7 @@ function getRuntimeGptAnswerSettlement(requestId) {
     const sourceField = sourceById.get(answer.field_id) || null;
     const binding = resolveLiveFieldForAnswer(answer, sourceField);
     const field = binding?.field || sourceField;
-    if (binding && hasFieldCurrentValue(binding.field, binding.controls)) {
+    if (binding && doesGeneratedAnswerMatchField(answer, binding.field, binding.controls)) {
       filled += 1;
       continue;
     }
@@ -3453,7 +3881,15 @@ function getMissingRequiredFields(fields) {
 }
 
 function hasMissingRequiredResumeUpload(fields) {
-  return (fields || []).some((field) => field.required && field.type === "file" && isResumeUploadField(field) && !hasRequiredFileFieldValue(field));
+  const collectedFileFieldMissing = (fields || []).some((field) =>
+    field.required && field.type === "file" && isResumeUploadField(field) && !hasRequiredFileFieldValue(field)
+  );
+  if (collectedFileFieldMissing) return true;
+
+  const requiredResumeInputs = getResumeFileInputs().filter((input) =>
+    input.required || input.getAttribute("aria-required") === "true"
+  );
+  return requiredResumeInputs.some((input) => !isResumeInputAttached(input)) && !hasResumeUploadedUi("");
 }
 
 function hasRequiredFileFieldValue(field) {
@@ -3587,12 +4023,13 @@ async function hydrateGeneratedChoiceOptions(fields) {
   }
 }
 
-function getGeneratedAnswerCandidateSkipReason(field, _filledIds) {
+function getGeneratedAnswerCandidateSkipReason(field, filledIds) {
   if (!field?.id) return "missing-field-id";
   if (isGeneratedAnswerIgnoredFieldType(field.type)) return "ignored-field-type";
   if (!field.required) return "not-required";
   if (isSensitiveGeneratedAnswerField(field)) return "sensitive-field";
   if (isProfileStaticQuestionField(field)) return "profile-static-field";
+  if (filledIds?.has?.(field.id)) return "already-resolved-locally";
 
   const controls = getControlsByFieldId(field.id);
   if (controls.length === 0) return "control-not-found";
@@ -3642,11 +4079,75 @@ function hasFieldCurrentValue(field, controls = getControlsByFieldId(field?.id))
   if (getControlType(controls[0]) === "combobox" && !hasCurrentChoiceValue(controls)) return false;
   const value = cleanLabel(getCurrentChoiceSummary(controls) || field?.value || "");
   if (!value || isPlaceholderChoice(value, value)) return false;
+  if (isRejectedGeneratedPlaceholder(value)) return false;
   if (isExperienceValueField(field, controls) && isZeroLikeExperienceValue(value)) return false;
 
   const placeholder = cleanLabel(field?.placeholder || controls[0]?.getAttribute?.("placeholder") || "");
   if (placeholder && normalize(value) === normalize(placeholder)) return false;
   return true;
+}
+
+function isGeneratedAnswerChoiceField(field) {
+  return field?.type === "checkbox" || isChoiceFieldType(field?.type);
+}
+
+function parseBooleanAnswer(value) {
+  const text = normalize(value);
+  if (/^(yes|true|agree|agreed|accept|accepted|checked|on|1)$/.test(text)) return true;
+  if (/^(no|false|decline|declined|reject|rejected|unchecked|off|0)$/.test(text)) return false;
+  return null;
+}
+
+function generatedAnswerValuesMatch(currentValue, expectedValue) {
+  const current = normalize(currentValue);
+  const expected = normalize(expectedValue);
+  if (!current || !expected) return false;
+  if (current === expected) return true;
+
+  const currentBoolean = parseBooleanAnswer(current);
+  const expectedBoolean = parseBooleanAnswer(expected);
+  if (currentBoolean !== null && expectedBoolean !== null) return currentBoolean === expectedBoolean;
+
+  return scoreChoice(current, expected) >= 80;
+}
+
+function doesGeneratedAnswerMatchField(answer, field, controls = getControlsByFieldId(field?.id)) {
+  const first = controls?.[0];
+  if (!first) return false;
+
+  const expectedValue = String(answer?.value ?? answer?.answer ?? "").trim();
+  if (!expectedValue) return false;
+  const type = getControlType(first);
+
+  if (type === "checkbox") {
+    const expected = parseBooleanAnswer(expectedValue);
+    if (expected === null) return false;
+
+    const explicitChoice = getSelectedCheckboxBooleanChoiceLabel(first);
+    if (explicitChoice) return parseBooleanAnswer(explicitChoice) === expected;
+
+    const option = cleanLabel(field?.option || answer?.option || getCheckboxOptionLabel(first, field?.question || field?.label || ""));
+    if (option) return isCheckboxChecked(first) === expected;
+
+    return expected === true && isCheckboxChecked(first);
+  }
+
+  const currentValue = getCurrentChoiceSummary(controls);
+  return generatedAnswerValuesMatch(currentValue, expectedValue);
+}
+
+async function waitForGeneratedAnswerMatch(answer, sourceField, fallbackControls = [], timeoutMs = 900) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const binding = resolveLiveFieldForAnswer(answer, sourceField);
+    const field = binding?.field || sourceField;
+    const controls = binding?.controls?.length ? binding.controls : fallbackControls;
+    if (field && doesGeneratedAnswerMatchField(answer, field, controls)) return true;
+    await sleep(90);
+  }
+
+  const binding = resolveLiveFieldForAnswer(answer, sourceField);
+  return Boolean(binding && doesGeneratedAnswerMatchField(answer, binding.field, binding.controls));
 }
 
 function isZeroLikeExperienceValue(value) {
@@ -3661,7 +4162,7 @@ function normalizeSheetAnswers(data) {
       value: String(answer.value ?? answer.answer ?? "").trim(),
       source: "sheet"
     }))
-    .filter((answer) => answer.field_id && answer.value);
+    .filter((answer) => answer.field_id && answer.value && !isRejectedGeneratedPlaceholder(answer.value));
 }
 
 function normalizeRuntimeGptAnswers(data) {
@@ -3674,7 +4175,7 @@ function normalizeRuntimeGptAnswers(data) {
       value: String(answer.value ?? answer.answer ?? "").trim(),
       source: "runtime-gpt"
     }))
-    .filter((answer) => answer.field_id && answer.value);
+    .filter((answer) => answer.field_id && answer.value && !isRejectedGeneratedPlaceholder(answer.value));
 }
 
 function normalizeDirectAiAnswers(data) {
@@ -3688,7 +4189,12 @@ function normalizeDirectAiAnswers(data) {
       model: answer.model || "",
       estimated_request_cost_usd: answer.estimated_request_cost_usd ?? null
     }))
-    .filter((answer) => answer.field_id && answer.value);
+    .filter((answer) => answer.field_id && answer.value && !isRejectedGeneratedPlaceholder(answer.value));
+}
+
+function isRejectedGeneratedPlaceholder(value) {
+  return /^(?:not specified|unspecified|unknown|not provided|not available|no information(?: provided| available)?|information unavailable|to be determined|tbd)$/i
+    .test(String(value || "").trim());
 }
 
 function buildSheetQuestionPayload(page, context, fields, profileContext = {}) {
@@ -3808,6 +4314,7 @@ function serializeSheetQuestionField(field) {
     option,
     label: question,
     raw_label: field.label,
+    help_text: getGeneratedFieldHelpText(controls[0], question),
     name: field.name,
     placeholder: field.placeholder,
     autocomplete: field.autocomplete,
@@ -3816,6 +4323,18 @@ function serializeSheetQuestionField(field) {
     options: field.options || [],
     current_value: hasFieldCurrentValue(field, controls) ? getCurrentChoiceSummary(controls) || field.value || "" : ""
   };
+}
+
+function getGeneratedFieldHelpText(control, question) {
+  if (!control) return "";
+  const described = cleanLabel(getDescribedByText(control));
+  const nearby = cleanLabel(getNearbyText(control));
+  const combined = cleanLabel([described, nearby].filter(Boolean).join(" "));
+  if (!combined) return "";
+  const withoutQuestion = question
+    ? combined.replace(new RegExp(escapeRegExp(question), "ig"), " ")
+    : combined;
+  return cleanLabel(withoutQuestion).slice(0, 800);
 }
 
 function getChoiceOptionTextFromControls(field, controls) {
@@ -3841,15 +4360,18 @@ function limitSheetText(value, maxLength) {
 
 function shouldApplyProfileStaticValue(field, controls, rawValue, key = "") {
   const first = controls[0];
-  if (key === "phone" && ["checkbox", "radio", "select", "combobox", "button-group"].includes(getControlType(first))) {
+  const type = getControlType(first);
+  if (key === "phone" && ["checkbox", "radio", "select", "combobox", "button-group"].includes(type)) {
     return false;
   }
+  if (type === "checkbox" && parseBooleanAnswer(rawValue) === null) return false;
 
   const current = String(getCurrentChoiceSummary(controls) || field.value || "").trim();
   if (!current) return true;
+  if (isRejectedGeneratedPlaceholder(current)) return true;
   if (normalize(current) === normalize(rawValue)) return false;
 
-  if (["checkbox", "radio", "select", "combobox", "button-group"].includes(getControlType(first))) {
+  if (["checkbox", "radio", "select", "combobox", "button-group"].includes(type)) {
     return !hasCurrentChoiceValue(controls);
   }
 
@@ -3912,8 +4434,12 @@ function matchProfileStaticFieldKey(field) {
   const text = normalize([field.autocomplete, field.name, field.label, field.placeholder].join(" "));
   const optionText = normalize((field.options || []).join(" "));
   if (isLanguageChoiceField(field)) return "";
+  if (isCombinedProfileLocationField(field)) return "location";
+  if (isBasedInLocationField(field)) return "";
   if (isAuthorizationSupportRequiredText(text)) return "";
+  if (isSemanticAvailabilityQuestion(field)) return "";
   if (isPlainFullNameField(field)) return "full_name";
+  if (isProfilePhoneField(field)) return "phone";
   const addressComponentKey = matchProfileAddressComponentKey(field);
   if (addressComponentKey) return addressComponentKey;
   if (/(work status|right to work|employment status)/.test(text) &&
@@ -3926,12 +4452,11 @@ function matchProfileStaticFieldKey(field) {
     ["last_name", ["family name", "last name", "lastname", "surname", "last_name"]],
     ["full_name", ["full name", "your name", "applicant name", "candidate name"]],
     ["email", ["email", "e mail", "mail"]],
-    ["phone", ["phone", "mobile", "telephone", "cell"]],
     ["notice_period", ["notice period", "current notice", "notice"]],
     ["expected_rate", ["hourly rate", "rate", "expected rate", "expected salary", "salary expectation", "salary expectations", "expected compensation", "desired salary", "desired compensation", "desired pay", "desired annual salary", "annual salary", "day rate", "pay expectation", "pay expectations", "gross monthly", "monthly salary", "salary", "compensation"]],
     ["work_authorization", ["authorized", "authorization", "legally work", "eligible to work", "right to work", "work status", "employment status"]],
     ["sponsorship", ["sponsor", "sponsorship", "visa"]],
-    ["availability", ["availability", "available", "start date"]],
+    ["availability", ["availability", "date available", "available date", "available start date", "earliest start date", "start date", "when can you start"]],
     ["linkedin", ["linkedin"]],
     ["github", ["github"]],
     ["portfolio", ["portfolio"]],
@@ -3948,6 +4473,26 @@ function matchProfileStaticFieldKey(field) {
   }
 
   return "";
+}
+
+function isProfilePhoneField(field) {
+  const type = normalize(field?.type || "");
+  const autocomplete = normalize(field?.autocomplete || "");
+  const text = normalize([field?.name, field?.label, field?.placeholder].filter(Boolean).join(" "));
+  if (type === "tel" || /^(tel|phone|mobile)$/.test(autocomplete)) return true;
+  if (/\b(phone|telephone|cell)(?:\s+number)?\b/.test(text)) return true;
+  return /\bmobile\b/.test(text) && (
+    /\bmobile\s+(?:phone|number|contact)\b/.test(text) ||
+    /^(?:your\s+)?mobile(?:\s+number)?$/.test(text)
+  );
+}
+
+function isSemanticAvailabilityQuestion(field) {
+  const text = normalize([field?.question, field?.label, field?.name, field?.placeholder].filter(Boolean).join(" "));
+  if (!text) return false;
+  const asksForAvailability = /(are|would|will|can|could|do) you.{0,80}(available|open|willing|able)|\bavailable for\b|\bopen (?:to|for)\b/.test(text);
+  const semanticWorkCondition = /(part time|full time|remote|onsite|on site|hybrid|contract|contractor|b2b|shift|hours|weekend|travel|relocat|collaboration)/.test(text);
+  return asksForAvailability && semanticWorkCondition;
 }
 
 function includesNormalizedProfilePhrase(text, phrase) {
@@ -3999,6 +4544,7 @@ function matchProfileAddressComponentKey(field) {
 function simplifyProfileAddressPrompt(value) {
   return normalize(value)
     .replace(/^(?:what is|please enter|please select|enter|select|choose|provide)\s+(?:your\s+)?(?:current\s+)?/, "")
+    .replace(/\s+(?:select|choose)(?:\s+(?:a|an)\s+option)?$/, "")
     .replace(/\s+(?:required|optional)$/, "")
     .trim();
 }
@@ -4008,7 +4554,18 @@ function isPlainFullNameField(field) {
   const candidates = [field.label, field.name, field.autocomplete]
     .map(normalize)
     .filter(Boolean);
-  return candidates.some((candidate) => ["name", "your name", "applicant name", "candidate name", "full name"].includes(candidate));
+  return candidates.some((candidate) =>
+    ["name", "your name", "applicant name", "candidate name", "full name", "preferred name"].includes(candidate) ||
+    /\bfirst(?:\s+and|\s*\/)\s*last\s+name\b|\blast(?:\s+and|\s*\/)\s*first\s+name\b/.test(candidate)
+  );
+}
+
+function isCombinedProfileLocationField(field) {
+  if (!isTextLikeStaticField(field)) return false;
+  const text = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!/(location|where.*based|based.*in|residence)/.test(text)) return false;
+  const parts = ["city", "state", "country"].filter((part) => new RegExp(`\\b${part}\\b`).test(text));
+  return parts.length >= 2 || /what location.*based|where.*(?:located|based|reside)/.test(text);
 }
 
 function isTextLikeStaticField(field) {
@@ -4022,7 +4579,7 @@ function getProfileStaticValue(staticFields, key) {
     expected_rate: ["expected_rate", "expected_salary", "salary_expectation", "salary_expectations", "monthly_salary", "monthly_salary_expectation", "desired_salary", "desired_compensation", "desired_pay", "pay_expectation", "pay_expectations", "annual_salary", "day_rate"],
     notice_period: ["notice_period", "current_notice_period", "availability_notice"],
     languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"],
-    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status", "nationality", "citizenship"],
+    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status"],
     nationality: ["nationality", "citizenship", "citizen_of", "country_of_citizenship"]
   };
 
@@ -4063,6 +4620,9 @@ function getProfileStaticValue(staticFields, key) {
 
 function getProfileStaticCandidateValues(staticFields, key, field, controls = []) {
   const primary = getProfileStaticValue(staticFields, key);
+  if (key === "phone") {
+    return getPhoneEntryCandidateValues(primary, staticFields, field, controls);
+  }
   if (!["location", "city"].includes(key)) {
     return uniqueNonEmptyValues([primary]);
   }
@@ -4075,6 +4635,50 @@ function getProfileStaticCandidateValues(staticFields, key, field, controls = []
   if (!searchableLocation) return uniqueNonEmptyValues([primary]);
   if (key === "city") return uniqueNonEmptyValues([city, location, primary]);
   return uniqueNonEmptyValues([location, city, primary]);
+}
+
+function getPhoneEntryCandidateValues(primary, staticFields, field, controls = []) {
+  const raw = String(primary || "").trim();
+  if (!raw) return [];
+
+  const country = getPhoneDialCountryValue(staticFields);
+  const dialCode = getDialCodeForCountry(country);
+  const hasSeparateDialCodeControl = location.hostname.toLowerCase().includes("workable.com") ||
+    controls.some((control) => hasNearbyPhoneDialCodeSelector(control)) ||
+    getPhoneDialCodeControls().length > 0;
+  if (!hasSeparateDialCodeControl || !dialCode) return uniqueNonEmptyValues([raw]);
+
+  const rawDigits = raw.replace(/\D/g, "");
+  const dialDigits = dialCode.replace(/\D/g, "");
+  const nationalDigits = rawDigits.startsWith(dialDigits)
+    ? rawDigits.slice(dialDigits.length).replace(/^0+/, "")
+    : rawDigits.replace(/^0+/, "");
+  const nationalFormatted = raw
+    .replace(new RegExp(`^(?:\\+|00)?${dialDigits}\\s*`), "")
+    .trim();
+
+  traceAutoBid("phone:national-candidates", {
+    field_id: field?.id || "",
+    country,
+    dial_code: dialCode,
+    values: uniqueNonEmptyValues([nationalDigits, nationalFormatted, raw]).map((value) => shortText(value))
+  });
+  return uniqueNonEmptyValues([nationalDigits, nationalFormatted, raw]);
+}
+
+function hasNearbyPhoneDialCodeSelector(phoneInput) {
+  const roots = [
+    phoneInput?.parentElement,
+    phoneInput?.closest?.("[class*='phone' i], [class*='field' i], [class*='input' i], .form-group"),
+    getFieldContainer(phoneInput)
+  ].filter(Boolean);
+  return roots.some((root) => queryAll([
+    "select",
+    "[role='combobox']",
+    "[aria-haspopup='listbox']",
+    "[aria-haspopup='menu']",
+    ".select__control"
+  ].join(","), root).some((control) => control !== phoneInput && isPhoneDialCodeSelector(control)));
 }
 
 function uniqueNonEmptyValues(values) {
@@ -4102,14 +4706,13 @@ function formatProfileStaticValueForField(key, value, field) {
 }
 
 function isBasedInLocationField(field) {
-  const label = normalize([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
-  return /(currently.*based.*in|based.*in|currently.*located.*in|located.*in|currently.*living.*in|living.*in|fully.*living.*resident.*in|living.*resident.*in|currently.*residing.*in|residing.*in|resident.*in|residency.*work permit.*in|work permit.*in|current.*residence.*in)/.test(label) &&
-    hasYesNoOptions(field.options);
+  const label = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  return /(currently.*based.*in|based.*in|currently.*located.*in|located.*in|currently.*living.*in|living.*in|fully.*living.*resident.*in|living.*resident.*in|currently.*residing.*in|residing.*in|resident.*in|residency.*work permit.*in|work permit.*in|current.*residence.*in)/.test(label);
 }
 
 function isLanguageChoiceField(field) {
   if (!field || !isChoiceFieldType(field.type)) return false;
-  const label = normalize([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  const label = normalize([field.question, field.label, field.option, field.name, field.placeholder].filter(Boolean).join(" "));
   if (!/(speak|language|fluent|fluency|proficien|native speaker|bilingual|multilingual)/.test(label)) return false;
   if (getQuestionLanguageAliases(label).length === 0) return false;
   return hasYesNoOptions(field.options) || isLanguageProficiencyScaleField(field);
@@ -4226,12 +4829,34 @@ function getQuestionLanguageAliases(label) {
   return getLanguageAliasesFromText(label);
 }
 
-function getLanguageChoiceAnswer(field, questionLanguages) {
+function getLanguageChoiceAnswer(field, questionLanguages, knownLanguages = []) {
   const isEnglish = (questionLanguages || []).some((language) => normalize(language) === "english");
-  if (isLanguageProficiencyScaleField(field)) {
-    return isEnglish ? "C1 Advanced" : getLowestLanguageProficiencyOption(field);
+  const isKnownLanguage = isEnglish || (questionLanguages || []).some((language) => knownLanguages.includes(language));
+
+  if (field?.type === "checkbox" && field.option) {
+    const option = normalize(field.option);
+    const isNoProficiency = /\b(none|nessuno|no proficiency|not applicable|n a)\b/.test(option);
+    const isProfessional = /\b(c1|c2|professional|professionale|advanced|avanzato|proficient|fluent)\b/.test(option);
+    const isNative = /\b(native|mother tongue|madrelingua)\b/.test(option);
+    const isScaleOption = isNoProficiency || isProfessional || isNative ||
+      /\b(a1|a2|b1|b2|basic|basico|intermediate|intermedio|elementary|beginner)\b/.test(option);
+
+    if (isScaleOption) {
+      if (!isKnownLanguage) return isNoProficiency ? "Yes" : "No";
+      return isProfessional && !isNative ? "Yes" : "No";
+    }
   }
-  return isEnglish ? "Yes" : "No";
+
+  if (isLanguageProficiencyScaleField(field)) {
+    return isKnownLanguage ? getPreferredLanguageProficiencyOption(field) : getLowestLanguageProficiencyOption(field);
+  }
+  return isKnownLanguage ? "Yes" : "No";
+}
+
+function getPreferredLanguageProficiencyOption(field) {
+  const options = field.options || [];
+  const preferred = options.find((option) => /\b(c1|professional|professionale|advanced|avanzato|proficient|fluent)\b/.test(normalize(option)));
+  return preferred || options.find((option) => /\bc2\b/.test(normalize(option))) || "C1 Advanced";
 }
 
 function isLanguageProficiencyScaleField(field) {
@@ -4519,10 +5144,6 @@ function getDeterministicDefault(field, controls) {
     return { value: "PostgreSQL", reason: "database-default" };
   }
 
-  if (isAuthorizationSupportRequiredChoiceField(field, controls)) {
-    return { value: "No", reason: "authorization-support-not-required" };
-  }
-
   if (isAvailabilityDateField(field, controls)) {
     return { value: formatDateForControl(getNextMondayDate(), controls[0], field), reason: "next-monday" };
   }
@@ -4566,14 +5187,14 @@ function isAvailabilityDateField(field, controls) {
   const control = controls?.[0];
   const type = getControlType(control);
   if (!["date", "text", "search"].includes(type)) return false;
-  const label = getFieldContextLabel(field, control);
+  const label = getDirectFieldLabel(field, control);
   return /(date available|available date|available start date|earliest.*start|start date|when.*start|availability date)/.test(label);
 }
 
 function getExperienceYearsDefault(field, controls) {
   const control = controls?.[0];
   const type = getControlType(control);
-  const label = getFieldContextLabel(field, control);
+  const label = getDirectFieldLabel(field, control);
   if (!isExperienceYearsLabel(label)) return null;
 
   const kind = getExperienceYearsKind(label);
@@ -4603,8 +5224,20 @@ function isExperienceValueField(field, controls) {
   const control = controls?.[0];
   const type = getControlType(control);
   if (!["range", "number", "text"].includes(type)) return false;
-  const label = getFieldContextLabel(field, control);
+  const label = getDirectFieldLabel(field, control);
   return isExperienceYearsLabel(label);
+}
+
+function getDirectFieldLabel(field, control) {
+  return normalize([
+    field?.question,
+    field?.label,
+    field?.name,
+    field?.placeholder,
+    field?.autocomplete,
+    control?.getAttribute?.("aria-label"),
+    control?.getAttribute?.("placeholder")
+  ].filter(Boolean).join(" "));
 }
 
 function isExperienceYearsLabel(label) {
@@ -5081,7 +5714,7 @@ function getCurrentChoiceSummary(controls) {
   }
 
   if (type === "checkbox") {
-    return isCheckboxChecked(first) ? "Yes" : "";
+    return getSelectedCheckboxBooleanChoiceLabel(first) || (isCheckboxChecked(first) ? "Yes" : "");
   }
 
   if (type === "button-group") {
@@ -5101,12 +5734,26 @@ function getCurrentChoiceSummary(controls) {
 }
 
 function shouldUsePositiveDropdownFallback(field) {
+  if (shouldDeferChoiceFieldToRuntimeGpt(field)) return false;
   if (isBasedInLocationField(field)) return false;
   if (isLanguageChoiceField(field)) return false;
   if (isAuthorizationSupportRequiredText(field.label)) return true;
   const label = normalize(field.label);
   if (/have you (?:ever )?used .+ before|used .+ previously/.test(label)) return false;
   return /(experience|years|level|proficiency|skill|expertise|knowledge|familiar|comfortable|rating|seniority|sponsor|sponsorship|visa|authorization|authorisation|authorized|eligible|willing|available|open to|agree|accept|consent|confirm|legally|relocat|remote|can you|able to|do you have|have you|do you use|have you used|use.*ai|ai.*assist|artificial intelligence|development workflow|meet.*requirement|salary|compensation)/.test(label);
+}
+
+function shouldDeferChoiceFieldToRuntimeGpt(field) {
+  if (!field?.required || !CHOICE_FIELD_TYPES.includes(field.type)) return false;
+  if (isSensitiveGeneratedAnswerField(field) || isLanguageChoiceField(field) || isConsentChoiceField(field) || isBasedInLocationField(field)) {
+    return false;
+  }
+  const atsId = atsAdapters?.describe?.().id || "";
+  const host = location.hostname.toLowerCase();
+  if (atsId === "newrocket" || host === "newrocket.com" || host.endsWith(".newrocket.com")) return true;
+
+  const text = normalize([field.question, field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  return /(experience|years|skill|proficien|expertise|knowledge|familiar|technology|framework|programming|software engineering|frontend|front end|backend|back end|full stack|mobile development|react|typescript|javascript|python|java|golang|cloud|aws|azure|gcp|docker|kubernetes|terraform|payment|fiscalization|database|sponsor|sponsorship|visa|work permit|right to work|authorized|authorised|eligible|legally work)/.test(text);
 }
 
 function shouldUsePositiveCheckboxFallback(field) {
@@ -5133,11 +5780,11 @@ async function setControlsValue(controls, value, field = null, context = {}) {
   }
 
   if (type === "checkbox") {
-    return setCheckboxValue(first, textValue);
+    return setCheckboxValue(first, textValue, field);
   }
 
   if (type === "button-group") {
-    return setButtonGroupValue(controls, textValue);
+    return setButtonGroupValue(controls, textValue, field);
   }
 
   if (type === "contenteditable") {
@@ -5227,13 +5874,32 @@ async function setControlsValue(controls, value, field = null, context = {}) {
 }
 
 async function waitForTextControlValue(control, expectedValue, timeoutMs) {
-  const expected = normalize(expectedValue);
+  const expected = String(expectedValue || "").trim();
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (normalize(getControlValue(control)) === expected && expected) return true;
+    if (areTextControlValuesEquivalent(control, getControlValue(control), expected)) return true;
     await sleep(80);
   }
-  return normalize(getControlValue(control)) === expected && Boolean(expected);
+  return areTextControlValuesEquivalent(control, getControlValue(control), expected);
+}
+
+function areTextControlValuesEquivalent(control, currentValue, expectedValue) {
+  const current = String(currentValue || "").trim();
+  const expected = String(expectedValue || "").trim();
+  if (!expected) return false;
+  const phoneLike = String(control?.type || "").toLowerCase() === "tel" ||
+    /\btel\b|phone|mobile/.test(normalize([
+      control?.getAttribute?.("autocomplete"),
+      control?.getAttribute?.("aria-label"),
+      control?.name,
+      control?.id
+    ].filter(Boolean).join(" ")));
+  if (phoneLike) {
+    const currentDigits = current.replace(/\D/g, "");
+    const expectedDigits = expected.replace(/\D/g, "");
+    return Boolean(expectedDigits) && currentDigits === expectedDigits;
+  }
+  return normalize(current) === normalize(expected);
 }
 
 async function clearControlsForRetry(controls) {
@@ -5346,12 +6012,15 @@ async function setRadioValue(controls, value) {
   if (!match) return false;
 
   const radio = match.control;
-  const target = getRadioClickTarget(radio);
-  await scrollElementIntoView(target, "center");
-  if (!await nativeClickElement(target)) {
-    dispatchRealisticMouseClick(target);
+  const targets = Array.from(new Set([
+    getRadioClickTarget(radio),
+    radio.closest?.("label, [class*='option' i], li, [role='radio'], [role='option']"),
+    radio
+  ].filter(Boolean)));
+
+  for (const target of targets) {
+    if (await activateChoiceTarget(target, () => isRadioChecked(radio))) return true;
   }
-  await sleep(180);
 
   if (!isRadioChecked(radio) && radio.matches?.("input[type='radio']")) {
     setNativeChecked(radio, true);
@@ -5360,6 +6029,32 @@ async function setRadioValue(controls, value) {
   }
 
   return isRadioChecked(radio);
+}
+
+async function activateChoiceTarget(target, isApplied) {
+  if (!target || !isVisible(target)) return false;
+  await scrollElementIntoView(target, "center");
+
+  await nativeClickElement(target);
+  await sleep(140);
+  if (isApplied()) return true;
+
+  dispatchRealisticMouseClick(target);
+  await sleep(140);
+  if (isApplied()) return true;
+
+  for (const key of [" ", "Enter"]) {
+    target.focus?.();
+    runPageCommand("key", target, { key });
+    const code = key === " " ? "Space" : "Enter";
+    const keyCode = key === " " ? 32 : 13;
+    target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, composed: true, key, code, keyCode, which: keyCode }));
+    target.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, composed: true, key, code, keyCode, which: keyCode }));
+    await sleep(140);
+    if (isApplied()) return true;
+  }
+
+  return false;
 }
 
 function getRadioClickTarget(radio) {
@@ -5375,17 +6070,54 @@ function getRadioClickTarget(radio) {
   return radio;
 }
 
-async function setCheckboxValue(control, value) {
-  const shouldCheck = /^(yes|true|agree|accepted|checked|1)$/i.test(String(value || "").trim());
-  if (isCheckboxChecked(control) === shouldCheck) return true;
+async function setCheckboxValue(control, value, field = null) {
+  const shouldCheck = parseBooleanAnswer(value);
+  if (shouldCheck === null) return false;
+
+  const booleanChoices = getCheckboxBooleanChoiceOptions(control);
+  const desiredChoice = booleanChoices.find((choice) => parseBooleanAnswer(choice.text) === shouldCheck);
+  if (desiredChoice) {
+    if (isCheckboxBooleanChoiceSelected(desiredChoice)) {
+      control.dataset.autoBidExplicitBooleanValue = shouldCheck ? "Yes" : "No";
+      return true;
+    }
+
+    let controlStateEventObserved = false;
+    const observeControlState = () => { controlStateEventObserved = true; };
+    control.addEventListener("input", observeControlState);
+    control.addEventListener("change", observeControlState);
+    await activateChoiceTarget(desiredChoice.control, () => {
+      const refreshed = getCheckboxBooleanChoiceOptions(control)
+        .find((choice) => parseBooleanAnswer(choice.text) === shouldCheck);
+      return Boolean(refreshed && isCheckboxBooleanChoiceSelected(refreshed)) ||
+        (controlStateEventObserved && isCheckboxChecked(control) === shouldCheck);
+    });
+    control.removeEventListener("input", observeControlState);
+    control.removeEventListener("change", observeControlState);
+
+    const refreshedChoice = getCheckboxBooleanChoiceOptions(control)
+      .find((choice) => parseBooleanAnswer(choice.text) === shouldCheck);
+    const verifiedByChoiceState = Boolean(refreshedChoice && isCheckboxBooleanChoiceSelected(refreshedChoice));
+    const verifiedByControlEvent = controlStateEventObserved && isCheckboxChecked(control) === shouldCheck;
+    if (verifiedByChoiceState || verifiedByControlEvent) {
+      control.dataset.autoBidExplicitBooleanValue = shouldCheck ? "Yes" : "No";
+      return true;
+    }
+    return false;
+  }
+
+  const option = cleanLabel(field?.option || getCheckboxOptionLabel(control, field?.question || field?.label || ""));
+  if (!option && shouldCheck === false) return false;
+  if (isCheckboxChecked(control) === shouldCheck) {
+    control.dataset.autoBidExplicitBooleanValue = shouldCheck ? "Yes" : "No";
+    return true;
+  }
 
   for (const target of getCheckboxClickTargets(control)) {
-    await scrollElementIntoView(target, "center");
-    if (!await nativeClickElement(target)) {
-      dispatchRealisticMouseClick(target);
+    if (await activateChoiceTarget(target, () => isCheckboxChecked(control) === shouldCheck)) {
+      control.dataset.autoBidExplicitBooleanValue = shouldCheck ? "Yes" : "No";
+      return true;
     }
-    await sleep(140);
-    if (isCheckboxChecked(control) === shouldCheck) return true;
   }
 
   const input = getCheckboxInput(control);
@@ -5398,7 +6130,80 @@ async function setCheckboxValue(control, value) {
   }
   await sleep(120);
 
-  return isCheckboxChecked(control) === shouldCheck;
+  const applied = isCheckboxChecked(control) === shouldCheck;
+  if (applied) control.dataset.autoBidExplicitBooleanValue = shouldCheck ? "Yes" : "No";
+  return applied;
+}
+
+function getCheckboxBooleanChoiceOptions(control) {
+  const fieldContainer = getFieldContainer(control);
+  const roots = [];
+  let current = control.parentElement;
+  for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+    if (current.matches?.("form, main, [role='main']")) break;
+    roots.push(current);
+    if (current === fieldContainer) break;
+  }
+  if (fieldContainer && !roots.includes(fieldContainer) && !fieldContainer.matches?.("form, main, [role='main']")) {
+    roots.push(fieldContainer);
+  }
+
+  const selector = "button, label, [role='button'], [role='radio'], [data-value], span, div";
+
+  for (const root of Array.from(new Set(roots))) {
+    const choices = [];
+    for (const element of queryAll(selector, root)) {
+      if (!isVisible(element) || element === control) continue;
+      const text = cleanLabel(element.getAttribute?.("data-value") || element.getAttribute?.("aria-label") || element.textContent || "");
+      if (!/^(yes|no)$/i.test(text)) continue;
+
+      const target = element.closest?.("button, label, [role='button'], [role='radio'], [data-value]") || element;
+      if (!root.contains?.(target) || !isVisible(target)) continue;
+      choices.push({ control: target, text });
+    }
+
+    const uniqueChoices = choices.filter((choice, index, list) => list.findIndex((item) => item.control === choice.control) === index);
+    const values = new Set(uniqueChoices.map((choice) => normalize(choice.text)));
+    if (values.has("yes") && values.has("no")) return uniqueChoices;
+  }
+
+  return [];
+}
+
+function isCheckboxBooleanChoiceSelected(choice) {
+  const target = choice?.control;
+  if (!target) return false;
+  const expectedText = normalize(choice.text);
+  const stateNodes = [target];
+  let parent = target.parentElement;
+  for (let depth = 0; parent && depth < 2; depth += 1, parent = parent.parentElement) {
+    if (normalize(parent.textContent || "") !== expectedText) break;
+    stateNodes.push(parent);
+  }
+
+  for (const node of stateNodes) {
+    if (isChoiceButtonSelected(node)) return true;
+    const selectedDescendant = node.querySelector?.("[aria-pressed='true'], [aria-checked='true'], [aria-selected='true'], [data-selected='true'], [data-state='checked'], [data-state='selected'], .selected, .active, [class*='selected' i], [class*='active' i]");
+    if (selectedDescendant) return true;
+    const radio = node.matches?.("input[type='radio']") ? node : node.querySelector?.("input[type='radio']");
+    if (radio?.checked) return true;
+  }
+
+  return false;
+}
+
+function getSelectedCheckboxBooleanChoiceLabel(control) {
+  const selected = getCheckboxBooleanChoiceOptions(control).find(isCheckboxBooleanChoiceSelected);
+  if (selected?.text) return selected.text;
+
+  const stored = cleanLabel(control?.dataset?.autoBidExplicitBooleanValue || "");
+  const storedBoolean = parseBooleanAnswer(stored);
+  if (storedBoolean === null) return "";
+  if (isCheckboxChecked(control) !== storedBoolean) {
+    delete control.dataset.autoBidExplicitBooleanValue;
+    return "";
+  }
+  return stored;
 }
 
 function getCheckboxClickTargets(control) {
@@ -5441,7 +6246,7 @@ function isCheckboxChecked(control) {
   return Boolean(control?.matches?.(".checked, .selected, .active, [class*='checked' i], [class*='selected' i], [class*='active' i]"));
 }
 
-async function setButtonGroupValue(controls, value) {
+async function setButtonGroupValue(controls, value, field = null) {
   const match = findBestChoice(
     controls.map((control) => ({
       control,
@@ -5452,13 +6257,21 @@ async function setButtonGroupValue(controls, value) {
   );
   if (!match) return false;
 
-  await scrollElementIntoView(match.control, "center");
-  if (!await nativeClickElement(match.control)) {
-    dispatchRealisticMouseClick(match.control);
-  }
-  await sleep(160);
+  const applied = await activateChoiceTarget(match.control, () => {
+    const liveControls = field?.id ? getControlsByFieldId(field.id) : controls;
+    return generatedAnswerValuesMatch(getSelectedChoiceButtonLabel(liveControls), value);
+  });
+  if (applied) return true;
+
   dispatchInput(match.control);
-  return true;
+
+  const started = Date.now();
+  while (Date.now() - started < 900) {
+    const liveControls = field?.id ? getControlsByFieldId(field.id) : controls;
+    if (generatedAnswerValuesMatch(getSelectedChoiceButtonLabel(liveControls), value)) return true;
+    await sleep(90);
+  }
+  return false;
 }
 
 async function setChoiceValue(controls, choice) {
@@ -5627,21 +6440,35 @@ async function openCombobox(control, filterValue, config = {}) {
   const trigger = getComboboxTrigger(control);
   const nativeClicked = await nativeClickElement(trigger);
   traceAutoBid("dropdown:open-click", describeComboboxState(control, { nativeClicked }));
-  if (!nativeClicked) {
-    runPageCommand("combobox-open", input || trigger);
-  }
+  if (canFilter) await applyComboboxFilter(input, filterValue, config.filterWaitMs);
+  options = canFilter
+    ? await waitForComboboxFilteredOptions(control, filterValue, 500)
+    : await waitForComboboxOptions(control, 500);
+  traceAutoBid("dropdown:open-after-click", describeComboboxState(control, { optionCount: options.length }));
+  if (options.length > 0) return options;
+
+  const pageTriggerOpened = runPageCommand("combobox-open", trigger);
+  const pageInputOpened = input !== trigger ? runPageCommand("combobox-open", input) : false;
   if (canFilter) await applyComboboxFilter(input, filterValue, config.filterWaitMs);
   options = canFilter
     ? await waitForComboboxFilteredOptions(control, filterValue, DROPDOWN_OPEN_TIMEOUT_MS)
     : await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
-  traceAutoBid("dropdown:open-after-click", describeComboboxState(control, { optionCount: options.length }));
+  traceAutoBid("dropdown:open-after-page-bridge", describeComboboxState(control, {
+    optionCount: options.length,
+    pageTriggerOpened,
+    pageInputOpened
+  }));
   if (options.length > 0) return options;
 
-  pressComboboxKey(input || control, "ArrowDown");
-  options = canFilter
-    ? await waitForComboboxFilteredOptions(control, filterValue, DROPDOWN_OPEN_TIMEOUT_MS)
-    : await waitForComboboxOptions(control, DROPDOWN_OPEN_TIMEOUT_MS);
-  traceAutoBid("dropdown:open-after-key", describeComboboxState(control, { optionCount: options.length }));
+  for (const key of ["ArrowDown", " "]) {
+    pressComboboxKey(input || control, key);
+    options = canFilter
+      ? await waitForComboboxFilteredOptions(control, filterValue, 900)
+      : await waitForComboboxOptions(control, 900);
+    traceAutoBid("dropdown:open-after-key", describeComboboxState(control, { key, optionCount: options.length }));
+    if (options.length > 0) break;
+  }
+
   if (options.length === 0) {
     reportAndClearNativeClickError(control);
     return [];
@@ -5776,6 +6603,11 @@ function getVisibleChoiceElements(control) {
     "[data-value]",
     "[cmdk-item]",
     ".select__option",
+    ".fab-MenuOption",
+    "[data-fabric-component='MenuOption']",
+    ".select2-results__option",
+    ".select2-result-label",
+    ".chosen-results li.active-result",
     "[data-testid*='option' i]",
     "[id*='option' i]",
     ...(atsAdapters?.getOptionSelectors?.() || [])
@@ -5830,6 +6662,12 @@ function getOpenChoiceContainers(control) {
     "[class*='option-list' i]",
     "[class*='select-menu' i]",
     "[class*='select__menu' i]",
+    ".fab-MenuVessel",
+    ".fab-MenuList",
+    ".select2-container--open",
+    ".select2-drop-active",
+    ".chosen-container-active",
+    ".chosen-drop",
     "[data-radix-popper-content-wrapper]"
   ].join(",");
 
@@ -6139,12 +6977,18 @@ function pressComboboxKey(control, key) {
 function getComboboxShell(control) {
   return control.closest(".select-shell") ||
     control.closest(".select__control") ||
+    control.closest(".fab-SelectToggle") ||
+    control.closest("[data-fabric-component='SelectToggle']") ||
+    control.closest(".select2-container") ||
+    control.closest(".chosen-container") ||
     control.closest("[data-radix-select-trigger], [data-slot='select-trigger']") ||
     (control.matches("[role='combobox']") ? control : control.closest("[role='combobox']"));
 }
 
 function getComboboxTrigger(control) {
   return control.closest(".select__control") ||
+    control.closest(".fab-SelectToggle, [data-fabric-component='SelectToggle']") ||
+    control.closest(".select2-selection, .select2-choice, .chosen-single") ||
     control.closest("[data-radix-select-trigger], [data-slot='select-trigger'], [role='combobox']") ||
     control;
 }
@@ -6156,7 +7000,7 @@ function getComboboxToggle(control) {
 
 function getComboboxSelectedText(control) {
   const shell = getComboboxShell(control);
-  const selected = shell?.querySelector(".select__single-value, [class*='single-value'], [aria-selected='true']");
+  const selected = shell?.querySelector(".select__single-value, [class*='single-value'], .fab-SelectToggle__content, .select2-selection__rendered, .select2-chosen, .chosen-single span, [aria-selected='true']");
   return cleanLabel(selected?.textContent || "");
 }
 
@@ -6166,7 +7010,11 @@ function getComboboxValueText(control) {
 }
 
 function getComboboxInput(control) {
-  return control.matches("input, textarea") ? control : control.querySelector("input, textarea") || control;
+  if (control.matches("input, textarea")) return control;
+  const shell = getComboboxShell(control);
+  return control.querySelector("input, textarea") ||
+    shell?.querySelector("input.select2-search__field, .select2-search input, .chosen-search input, input[role='combobox'], input[aria-autocomplete]") ||
+    control;
 }
 
 function setNativeValue(control, value) {
@@ -6454,6 +7302,10 @@ function buildLocationAliases(value, options = {}) {
 
   if (text.includes("european union") || /\beu\b/.test(text) || text.includes("europe")) {
     aliases.push("eu", "europe", "european union");
+  }
+
+  if (text.includes("masovian") || text.includes("masovia") || text.includes("mazowieckie")) {
+    aliases.push("masovian voivodeship", "masovian", "masovia", "mazowieckie");
   }
 
   if (includeCountryRegions && (EU_COUNTRY_NAMES.has(text) || Array.from(EU_COUNTRY_NAMES).some((country) => text.includes(country)))) {

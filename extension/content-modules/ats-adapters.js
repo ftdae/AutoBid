@@ -5,7 +5,10 @@
     "[role='button'][aria-haspopup='menu'][aria-expanded]",
     "[data-headlessui-state][role='combobox']",
     "[data-testid*='select' i][aria-expanded]",
-    "[data-testid*='dropdown' i][aria-expanded]"
+    "[data-testid*='dropdown' i][aria-expanded]",
+    ".select2-selection",
+    ".select2-choice",
+    ".chosen-single"
   ];
 
   const COMMON_OPTION_SELECTORS = [
@@ -14,7 +17,10 @@
     "[role='menuitem']",
     "[data-value]",
     "[data-radix-collection-item]",
-    "[cmdk-item]"
+    "[cmdk-item]",
+    ".select2-results__option",
+    ".select2-result-label",
+    ".chosen-results li.active-result"
   ];
 
   const DEFINITIONS = [
@@ -27,10 +33,29 @@
     }),
     adapter("bamboohr", "BambooHR", [/(^|\.)bamboohr\.com$/i], {
       markers: [".fab-FormRow", "[data-bi-id*='careers']"],
-      controls: [".fab-FormRow input", ".fab-FormRow textarea", ".fab-FormRow select", ".fab-Select__control"],
+      controls: [
+        ".fab-FormRow input",
+        ".fab-FormRow textarea",
+        ".fab-FormRow select",
+        ".fab-FormRow [role='combobox']",
+        ".fab-FormRow [aria-haspopup='listbox']",
+        ".fab-FormRow .fab-SelectToggle",
+        ".fab-FormRow [data-fabric-component='SelectToggle']",
+        ".fab-FormRow [class*='Select__control']",
+        ".fab-Select__control",
+        ".fab-SelectToggle",
+        "[data-fabric-component='SelectToggle']"
+      ],
       containers: [".fab-FormRow", ".fab-FormSection", "fieldset"],
       labels: [".fab-FormRow__label", ".fab-Label", "legend"],
-      options: [".fab-Select__option", "[class*='fab-Select'] [role='option']"]
+      options: [
+        ".fab-Select__option",
+        "[class*='fab-Select'] [role='option']",
+        "[class*='Select__option']",
+        ".fab-MenuOption",
+        "[data-fabric-component='MenuOption']"
+      ],
+      uploads: [".fab-FormRow input[type='file']", "input[type='file']"]
     }),
     adapter("gem", "Gem", [/(^|\.)gem\.com$/i, /(^|\.)gem\.co$/i], {
       markers: ["[data-testid*='application-form']", "[class*='ApplicationForm']"],
@@ -50,6 +75,36 @@
       containers: [".field", ".application-question", "[data-testid*='field']", "fieldset"],
       labels: [".field-label", ".application-question label", "[data-testid*='label']", "legend"],
       options: ["[id*='react-select'][id*='option']", ".select__option", "[data-testid*='option']"],
+      uploads: ["#resume", "input[name*='resume' i]", "input[id*='resume' i]"]
+    }),
+    adapter("newrocket", "NewRocket Greenhouse", [/(^|\.)newrocket\.com$/i], {
+      markers: ["#application_form", "#application-form", ".application--questions", ".select2-container"],
+      controls: [
+        "#application_form input",
+        "#application_form textarea",
+        "#application_form select",
+        "#application_form [role='combobox']",
+        "#application_form .select2-selection",
+        "#application_form .select2-choice",
+        "#application_form .chosen-single",
+        "#application-form input",
+        "#application-form textarea",
+        "#application-form select",
+        "#application-form [role='combobox']",
+        "#application-form .select2-selection",
+        "#application-form .select2-choice",
+        "#application-form .chosen-single"
+      ],
+      containers: [".field", ".application-question", ".field-entry", ".form-field", "fieldset"],
+      labels: [".field-label", ".application-question label", ".field-entry label", "legend"],
+      options: [
+        ".select2-results__option",
+        ".select2-result-label",
+        ".chosen-results li.active-result",
+        "[id*='react-select'][id*='option']",
+        ".select__option",
+        "[role='option']"
+      ],
       uploads: ["#resume", "input[name*='resume' i]", "input[id*='resume' i]"]
     }),
     adapter("hibob", "HiBob", [/(^|\.)hibob\.com$/i, /(^|\.)bob\.co$/i], {
@@ -133,11 +188,21 @@
       options: ["[class*='select-option']", "[role='option']"]
     }),
     adapter("teamtailor", "Teamtailor", [/(^|\.)teamtailor\.com$/i], {
-      markers: ["[data-controller*='jobs--application']", "[class*='application-form']"],
+      markers: [
+        "#job-application-form[data-controller~='careersite--form']",
+        "[data-controller~='forms--inputs--upload']",
+        "[data-controller*='jobs--application']",
+        "[class*='application-form']"
+      ],
       controls: ["[data-controller*='application'] input", "[data-controller*='application'] textarea", "[data-controller*='application'] select", "[data-controller*='application'] [role='combobox']"],
       containers: ["[data-question-id]", ".form-group", "[class*='field']", "fieldset"],
       labels: ["[data-question-label]", ".form-label", "legend"],
-      options: ["[data-option-id]", "[role='option']"]
+      options: ["[data-option-id]", "[role='option']"],
+      uploads: [
+        "[data-controller~='forms--inputs--upload'][id*='resume' i] input[type='file']",
+        "[data-controller~='forms--inputs--upload'] input.dz-hidden-input",
+        "input.dz-hidden-input"
+      ]
     }),
     adapter("wellfound", "Wellfound", [/(^|\.)wellfound\.com$/i, /(^|\.)angel\.co$/i], {
       markers: ["[data-test*='application']", "[class*='Application']"],
@@ -229,16 +294,21 @@
 
     function isRequired(control) {
       const container = getFieldContainer(control);
+      const nestedControls = container
+        ? safeQueryAll(container, "input, textarea, select, [role='checkbox'], [role='radio'], [role='combobox']").length
+        : 0;
+      const scopedContainer = nestedControls <= 1;
       const text = cleanText([
         control.getAttribute?.("aria-label"),
         control.getAttribute?.("data-automation-id"),
-        container?.textContent
+        ...getLabelCandidates(control),
+        scopedContainer ? container?.textContent : ""
       ].filter(Boolean).join(" "));
       return Boolean(
         control.required ||
         control.getAttribute?.("aria-required") === "true" ||
         container?.matches?.("[aria-required='true'], [data-required='true']") ||
-        container?.querySelector?.("[aria-required='true'], [required], [class*='required' i]") ||
+        scopedContainer && container?.querySelector?.("[aria-required='true'], [required], [class*='required' i]") ||
         /(^|\s)\*(\s|$)/.test(text) ||
         /\brequired\b/i.test(text)
       );
@@ -247,6 +317,7 @@
     function getControlType(control) {
       if (control.matches?.("[contenteditable='true'][role='textbox']")) return "contenteditable";
       if (control.matches?.("[role='button'][aria-haspopup='listbox'], [role='button'][aria-haspopup='menu']")) return "combobox";
+      if (control.matches?.(".fab-Select__control, [class*='Select__control'], .fab-SelectToggle, [data-fabric-component='SelectToggle'], .select2-selection, .select2-choice, .chosen-single")) return "combobox";
       return "";
     }
 

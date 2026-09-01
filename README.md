@@ -5,7 +5,7 @@ Standalone auto-bid assistant with:
 - PostgreSQL-backed signup/login
 - multiple user profiles
 - static profile autofill fields
-- ChatGPT extension first, then one OpenAI attempt for unresolved required complex fields
+- ChatGPT extension routing for unresolved required complex fields; OpenAI routing disabled by default
 - ATS-aware form adapters with a common fallback engine
 - encrypted Outlook verification-message integration
 - resizable right-side workspace and persistent execution logs
@@ -33,11 +33,10 @@ http://localhost:7003
 
 ### Backend terminal logs
 
-The backend prints structured, timestamped logs for every HTTP request and response, background assist job, and OpenAI fallback request/result. The request or job ID in brackets correlates parallel work:
+The backend prints structured, timestamped logs for every HTTP request and response and background assist job. The request or job ID in brackets correlates parallel work. When OpenAI routing is disabled, assist logs report `OPENAI_SKIPPED` with `route-disabled`.
 
 ```text
-2026-08-27T10:15:30.120Z [AutoBid] [abaj_...] OPENAI_REQUEST {...}
-2026-08-27T10:15:31.402Z [AutoBid] [abaj_...] OPENAI_RESPONSE {"status":"success","duration_ms":1282,...}
+2026-08-27T10:15:30.120Z [AutoBid] [abaj_...] OPENAI_SKIPPED {"reason":"route-disabled",...}
 2026-08-27T10:15:31.410Z [AutoBid] [abaj_...] ASSIST_JOB_COMPLETED {...}
 ```
 
@@ -45,7 +44,7 @@ Secrets are redacted and long page/resume text is truncated. Restart `npm start`
 
 Set `APP_SECRET` and `DATABASE_URL` in `.env`.
 
-Complex required questions go to the ChatGPT browser worker first. Only fields still unresolved after that one ChatGPT attempt are sent to the backend OpenAI router.
+Complex required questions go to the ChatGPT browser workers. Fields that remain unresolved are left unfilled; they are not sent to OpenAI. To restore the backend fallback later, set `OPENAI_ROUTE_ENABLED=true` and enable the extension route deliberately.
 
 If you do not already have PostgreSQL running, start the included local database:
 

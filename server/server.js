@@ -3,7 +3,7 @@ import { createToken, hashPassword, normalizeEmail, readToken, verifyPassword } 
 import { ensureQuestions, loadCacheAnswers, saveAiAnswers } from "./assist/cache.js";
 import { normalizeFields, normalizePage, shouldAnswerWithAi } from "./assist/field-policy.js";
 import { generateAiAnswers } from "./assist/ai.js";
-import { DEV_AUTH_BYPASS, DEV_USER_EMAIL, PORT } from "./config.js";
+import { DEV_AUTH_BYPASS, DEV_USER_EMAIL, OPENAI_ROUTE_ENABLED, PORT } from "./config.js";
 import { pool } from "./db/pool.js";
 import { ensureSchema } from "./db/schema.js";
 import { readJson, sendJson, setCorsHeaders } from "./http/json.js";
@@ -654,13 +654,16 @@ async function buildAssistResponse(user, body, logContext = {}) {
   const cache = databaseAvailable
     ? await loadCacheAnswers(pool, fields, profile, jobHash, staticAnswers)
     : { answers: new Map(), hits: 0 };
-  const fieldsForAi = fields.filter((field) => shouldAnswerWithAi(field) && !staticAnswers.has(field.id) && !cache.answers.has(field.id));
+  const fieldsForAi = OPENAI_ROUTE_ENABLED
+    ? fields.filter((field) => shouldAnswerWithAi(field) && !staticAnswers.has(field.id) && !cache.answers.has(field.id))
+    : [];
   const warnings = [];
   logBackendEvent("ASSIST_PLAN", {
     job_id: logContext.jobId || null,
     mode: logContext.mode || "unknown",
-    provider: "openai",
-    route_position: 2,
+    provider: OPENAI_ROUTE_ENABLED ? "openai" : "disabled",
+    route_position: OPENAI_ROUTE_ENABLED ? 2 : null,
+    openai_enabled: OPENAI_ROUTE_ENABLED,
     page: {
       url: page.url,
       title: page.title,

@@ -1,12 +1,24 @@
 {
   "manifest_version": 3,
   "name": "Auto Bid Assistant",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Detect required job application fields, reuse cached answers, and fill reviewed drafts from selected profiles.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": ["storage", "activeTab", "tabs", "scripting", "debugger", "identity", "alarms"],
   "host_permissions": ["<all_urls>"],
   "action": {
-    "default_title": "Auto Bid"
+    "default_title": "Auto Bid",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"

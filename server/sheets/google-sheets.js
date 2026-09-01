@@ -1,9 +1,6 @@
-import { createHash, createSign } from "node:crypto";
+import { createSign } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns";
-import { mkdir, writeFile } from "node:fs/promises";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
-import os from "node:os";
-import path from "node:path";
 import {
   GOOGLE_APPS_SCRIPT_CONNECT_HOST,
   GOOGLE_APPS_SCRIPT_SECRET,
@@ -269,7 +266,7 @@ export async function readResumeFilePayload({
     accept
   });
 
-  return writeResumePayloadToLocalFile(normalizeResumeFilePayload(data, rowNumber));
+  return normalizeResumeFilePayload(data, rowNumber);
 }
 
 function shouldUseAppsScriptBridge() {
@@ -777,56 +774,6 @@ function findFirstUrlInSheetValues(values = {}, raw = []) {
   }
 
   return "";
-}
-
-async function writeResumePayloadToLocalFile(payload) {
-  const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "");
-  if (!base64) return payload;
-
-  const bytes = Buffer.from(base64, "base64");
-  if (!bytes.length) return payload;
-
-  const hash = createHash("sha256")
-    .update(String(payload.source_url || ""))
-    .update(String(payload.filename || ""))
-    .update(bytes)
-    .digest("hex")
-    .slice(0, 24);
-  const filename = ensureResumeFilenameExtension(sanitizeLocalFilename(payload.filename || "resume.pdf"), payload.mime_type);
-  const directory = path.join(os.tmpdir(), "autobid-resumes", hash);
-  const localPath = path.join(directory, filename);
-
-  await mkdir(directory, { recursive: true });
-  await writeFile(localPath, bytes);
-
-  return {
-    ...payload,
-    size: payload.size || bytes.length,
-    local_path: localPath
-  };
-}
-
-function sanitizeLocalFilename(value) {
-  return String(value || "resume.pdf")
-    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
-    .replace(/\s+/g, " ")
-    .trim() || "resume.pdf";
-}
-
-function ensureResumeFilenameExtension(filename, mimeType) {
-  if (/\.[a-z0-9]{2,8}$/i.test(filename)) return filename;
-  const extension = mimeTypeToExtension(mimeType);
-  return `${filename}.${extension}`;
-}
-
-function mimeTypeToExtension(mimeType) {
-  const value = String(mimeType || "").toLowerCase();
-  if (value.includes("jpeg")) return "jpg";
-  if (value.includes("png")) return "png";
-  if (value.includes("msword")) return "doc";
-  if (value.includes("wordprocessingml")) return "docx";
-  if (value.includes("rtf")) return "rtf";
-  return "pdf";
 }
 
 function cellUpdate(sheetName, column, row, value) {

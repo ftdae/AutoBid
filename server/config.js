@@ -14,6 +14,7 @@ export const GEMINI_MODEL = env.GEMINI_MODEL || process.env.GEMINI_MODEL || "gem
 export const GEMINI_MODELS = normalizeList(env.GEMINI_MODELS || process.env.GEMINI_MODELS || GEMINI_MODEL);
 export const OPENAI_API_KEY = env.OPENAI_API_KEY || env.GPT_API_KEY || process.env.OPENAI_API_KEY || process.env.GPT_API_KEY || "";
 export const OPENAI_MODEL = env.OPENAI_MODEL || process.env.OPENAI_MODEL || "gpt-5-mini";
+export const OPENAI_ROUTE_ENABLED = normalizeBoolean(env.OPENAI_ROUTE_ENABLED || process.env.OPENAI_ROUTE_ENABLED, false);
 export const GOOGLE_APPS_SCRIPT_WEB_APP_URL = env.GOOGLE_APPS_SCRIPT_WEB_APP_URL || env.APPS_SCRIPT_WEB_APP_URL || process.env.GOOGLE_APPS_SCRIPT_WEB_APP_URL || process.env.APPS_SCRIPT_WEB_APP_URL || "";
 export const GOOGLE_APPS_SCRIPT_SECRET = env.GOOGLE_APPS_SCRIPT_SECRET || env.CHATGPT_EXTENSION_SECRET || env.EXTENSION_SECRET || process.env.GOOGLE_APPS_SCRIPT_SECRET || process.env.CHATGPT_EXTENSION_SECRET || process.env.EXTENSION_SECRET || "";
 export const GOOGLE_APPS_SCRIPT_CONNECT_HOST = env.GOOGLE_APPS_SCRIPT_CONNECT_HOST || process.env.GOOGLE_APPS_SCRIPT_CONNECT_HOST || "www.google.com";
@@ -69,4 +70,9 @@ function normalizeList(value) {
 function normalizePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (value == null || value === "") return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value).trim());
 }

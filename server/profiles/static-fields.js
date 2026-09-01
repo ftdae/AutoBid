@@ -26,7 +26,10 @@ export function matchStaticFieldKey(field) {
   const text = normalizeText([field.autocomplete, field.name, field.label, field.placeholder].join(" "));
   const optionText = normalizeText((field.options || []).join(" "));
   if (isLanguageYesNoField(field)) return null;
+  if (isCombinedLocationField(field)) return "location";
+  if (isSemanticBasedInQuestion(field)) return null;
   if (isPlainFullNameField(field)) return "full_name";
+  if (isPhoneStaticField(field)) return "phone";
   const addressComponentKey = matchAddressComponentFieldKey(field);
   if (addressComponentKey) return addressComponentKey;
   if (/(work status|right to work|employment status)/.test(text) &&
@@ -38,7 +41,6 @@ export function matchStaticFieldKey(field) {
     ["last_name", ["family name", "last name", "lastname", "surname", "last_name"]],
     ["full_name", ["full name", "your name", "applicant name"]],
     ["email", ["email", "e mail", "mail"]],
-    ["phone", ["phone", "mobile", "telephone", "cell"]],
     ["location", ["location", "address", "current city", "current location"]],
     ["city", ["city"]],
     ["nationality", ["nationality", "citizenship", "country of citizenship", "citizen of"]],
@@ -74,7 +76,7 @@ export function getStaticFieldValue(staticFields, key) {
     expected_rate: ["expected_rate", "expected_salary", "salary_expectation", "salary_expectations", "monthly_salary", "monthly_salary_expectation", "desired_salary", "desired_compensation"],
     notice_period: ["notice_period", "current_notice_period", "availability_notice"],
     languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"],
-    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status", "nationality", "citizenship"],
+    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status"],
     nationality: ["nationality", "citizenship", "citizen_of", "country_of_citizenship"]
   };
 
@@ -98,7 +100,18 @@ function isPlainFullNameField(field) {
   const candidates = [field.label, field.name, field.autocomplete]
     .map(normalizeText)
     .filter(Boolean);
-  return candidates.some((candidate) => ["name", "your name", "applicant name", "candidate name", "full name"].includes(candidate));
+  return candidates.some((candidate) =>
+    ["name", "your name", "applicant name", "candidate name", "full name", "preferred name"].includes(candidate) ||
+    /\bfirst(?:\s+and|\s*\/)\s*last\s+name\b|\blast(?:\s+and|\s*\/)\s*first\s+name\b/.test(candidate)
+  );
+}
+
+function isCombinedLocationField(field) {
+  if (!isTextLikeStaticField(field)) return false;
+  const text = normalizeText([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!/(location|where.*based|based.*in|residence)/.test(text)) return false;
+  const parts = ["city", "state", "country"].filter((part) => new RegExp(`\\b${part}\\b`).test(text));
+  return parts.length >= 2 || /what location.*based|where.*(?:located|based|reside)/.test(text);
 }
 
 function isTextLikeStaticField(field) {
@@ -111,6 +124,23 @@ function isLanguageYesNoField(field) {
   return /(speak|language|fluent|fluency|proficien|native speaker|bilingual|multilingual)/.test(text) &&
     options.includes("yes") &&
     options.includes("no");
+}
+
+function isSemanticBasedInQuestion(field) {
+  const text = normalizeText([field?.label, field?.name, field?.placeholder].filter(Boolean).join(" "));
+  return /(currently.*based.*in|based.*in|currently.*located.*in|located.*in|currently.*living.*in|currently.*residing.*in|resident.*in)/.test(text);
+}
+
+function isPhoneStaticField(field) {
+  const type = normalizeText(field?.type || "");
+  const autocomplete = normalizeText(field?.autocomplete || "");
+  const text = normalizeText([field?.name, field?.label, field?.placeholder].filter(Boolean).join(" "));
+  if (type === "tel" || /^(tel|phone|mobile)$/.test(autocomplete)) return true;
+  if (/\b(phone|telephone|cell)(?:\s+number)?\b/.test(text)) return true;
+  return /\bmobile\b/.test(text) && (
+    /\bmobile\s+(?:phone|number|contact)\b/.test(text) ||
+    /^(?:your\s+)?mobile(?:\s+number)?$/.test(text)
+  );
 }
 
 function matchAddressComponentFieldKey(field) {

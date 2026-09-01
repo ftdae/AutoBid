@@ -20,9 +20,9 @@ const GPT_BATCH_STATES_STORAGE_KEY = "autoBidGptBatchStatesV2";
 const GPT_BATCH_PAUSED_STORAGE_KEY = "autoBidGptBatchPaused";
 const RUNTIME_GPT_QUEUE_STORAGE_KEY = "autoBidRuntimeGptQueueV2";
 const GPT_WORKER_URL = "https://chatgpt.com/?autobid_worker=1";
-// Five requests may share one prompt, but a worker has no lifetime request cap.
-// The same five persistent ChatGPT tabs are recycled until the queue is empty.
-const RUNTIME_GPT_PROMPT_BATCH_SIZE = 5;
+// Keep application contexts isolated: one application per prompt, with five
+// persistent workers running in parallel. The durable queue itself is unlimited.
+const RUNTIME_GPT_PROMPT_BATCH_SIZE = 1;
 const RUNTIME_GPT_MAX_WORKERS = 5;
 const RUNTIME_GPT_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const RUNTIME_GPT_LEASE_MS = 5 * 60 * 1000;
@@ -689,15 +689,15 @@ function nativeFileUpload(sender, payload) {
   if ((sender.frameId || 0) !== 0) throw new Error("Native file upload is currently supported in the top page only");
 
   const token = String(payload.token || "");
-  const filePath = String(payload.local_path || payload.localPath || "");
-  if (!token || !filePath) throw new Error("Native file upload requires a target token and local file path");
+  if (!token) throw new Error("Native file upload requires a target token");
+  normalizeNativeFilePayload(payload);
 
   return queueNativeInput(tabId, () => dispatchNativeFileUpload(tabId, payload));
 }
 
 async function dispatchNativeFileUpload(tabId, payload, reconnectAttempt = 0) {
   const token = String(payload.token || "");
-  const filePath = String(payload.local_path || payload.localPath || "");
+  const filePayload = normalizeNativeFilePayload(payload);
 
   const target = await acquireNativeDebugger(tabId);
   let objectId = "";
@@ -729,27 +729,15 @@ async function dispatchNativeFileUpload(tabId, payload, reconnectAttempt = 0) {
     objectId = evaluated?.result?.objectId || "";
     if (!objectId) throw new Error("File input was not found on the page");
 
-    await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
-      objectId,
-      files: [filePath]
-    });
-    const eventResult = await chrome.debugger.sendCommand(target, "Runtime.callFunctionOn", {
-      objectId,
-      functionDeclaration: `function() {
-        this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-        this.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-        return this.files ? this.files.length : 0;
-      }`,
-      returnByValue: true
-    });
+    const files = await setDebuggerFileInputFromBytes(target, objectId, filePayload);
 
     await releaseDebuggerObject(target, objectId);
     objectId = "";
     scheduleNativeDebuggerDetach(tabId);
     return {
       uploaded: true,
-      files: Number(eventResult?.result?.value || 0),
-      local_path: filePath
+      files,
+      transport: "bytes"
     };
   } catch (error) {
     if (objectId) await releaseDebuggerObject(target, objectId);
@@ -776,11 +764,10 @@ function nativeFileChooserUpload(sender, payload) {
 async function dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt = 0) {
   const x = Number(payload.x);
   const y = Number(payload.y);
-  const filePath = String(payload.local_path || payload.localPath || "");
+  const filePayload = normalizeNativeFilePayload(payload);
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
     throw new Error("Invalid native file chooser click coordinates");
   }
-  if (!filePath) throw new Error("Native file chooser upload requires a local file path");
 
   const target = await acquireNativeDebugger(tabId);
   let objectId = "";
@@ -817,30 +804,14 @@ async function dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt 
     const chooser = await chooserPromise;
     if (!chooser?.backendNodeId) throw new Error("File chooser opened without an input node");
 
-    await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
-      backendNodeId: chooser.backendNodeId,
-      files: [filePath]
-    });
-
     const resolved = await chrome.debugger.sendCommand(target, "DOM.resolveNode", {
       backendNodeId: chooser.backendNodeId,
       objectGroup: "auto-bid-file-chooser-upload"
     }).catch(() => null);
     objectId = resolved?.object?.objectId || "";
 
-    let files = 1;
-    if (objectId) {
-      const eventResult = await chrome.debugger.sendCommand(target, "Runtime.callFunctionOn", {
-        objectId,
-        functionDeclaration: `function() {
-          this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-          this.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-          return this.files ? this.files.length : 0;
-        }`,
-        returnByValue: true
-      }).catch(() => null);
-      files = Number(eventResult?.result?.value || files);
-    }
+    if (!objectId) throw new Error("File chooser input could not be resolved");
+    const files = await setDebuggerFileInputFromBytes(target, objectId, filePayload);
 
     if (objectId) {
       await releaseDebuggerObject(target, objectId);
@@ -852,7 +823,7 @@ async function dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt 
       uploaded: true,
       files,
       mode: chooser.mode || "",
-      local_path: filePath
+      transport: "bytes"
     };
   } catch (error) {
     if (objectId) await releaseDebuggerObject(target, objectId);
@@ -867,6 +838,67 @@ async function dispatchNativeFileChooserUpload(tabId, payload, reconnectAttempt 
     }
     throw new Error(`Native file chooser upload failed: ${message}`);
   }
+}
+
+function normalizeNativeFilePayload(payload = {}) {
+  const base64 = String(payload.base64 || "").replace(/^data:[^,]+,/, "").trim();
+  if (!base64) throw new Error("Native file upload requires file bytes");
+  if (base64.length > 20 * 1024 * 1024) throw new Error("Native file upload is limited to 15 MB");
+
+  return {
+    base64,
+    filename: String(payload.filename || payload.name || "resume.pdf")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
+      .trim() || "resume.pdf",
+    mimeType: String(payload.mime_type || payload.mimeType || "application/pdf").trim() || "application/pdf"
+  };
+}
+
+async function setDebuggerFileInputFromBytes(target, objectId, filePayload) {
+  const callResult = await chrome.debugger.sendCommand(target, "Runtime.callFunctionOn", {
+    objectId,
+    functionDeclaration: `function(base64, filename, mimeType) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      const file = new File([bytes], filename, { type: mimeType });
+      const owner = this.closest?.("[data-controller~='forms--inputs--upload'], .dropzone, [class*='dropzone' i]") || this;
+      const signature = [filename, bytes.length, mimeType, base64.length, base64.slice(0, 24), base64.slice(-24)].join("|");
+      let hash = 2166136261;
+      for (let index = 0; index < signature.length; index += 1) {
+        hash ^= signature.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      const uploadKey = "abf_" + (hash >>> 0).toString(36);
+      if (owner.getAttribute("data-auto-bid-file-upload-key") === uploadKey) {
+        return { files: this.files ? this.files.length : 0, filename: this.files?.[0]?.name || "", duplicateSuppressed: true };
+      }
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      this.files = transfer.files;
+      owner.setAttribute("data-auto-bid-file-upload-key", uploadKey);
+      owner.setAttribute("data-auto-bid-file-upload-state", "dispatched");
+      const managedDropzone = this.matches?.(".dz-hidden-input") || owner !== this;
+      if (!managedDropzone) this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      this.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return { files: this.files ? this.files.length : 0, filename: this.files?.[0]?.name || "" };
+    }`,
+    arguments: [
+      { value: filePayload.base64 },
+      { value: filePayload.filename },
+      { value: filePayload.mimeType }
+    ],
+    returnByValue: true
+  });
+
+  if (callResult?.exceptionDetails) {
+    throw new Error(callResult.exceptionDetails.text || "The page rejected the resume file bytes");
+  }
+  const files = Number(callResult?.result?.value?.files || 0);
+  if (files < 1) throw new Error("The page did not accept the resume file bytes");
+  return files;
 }
 
 function waitForFileChooserOpened(tabId, timeoutMs) {
@@ -1581,7 +1613,12 @@ function normalizeRuntimeGptAnswers(answers) {
       value: String(answer.value ?? answer.answer ?? "").trim(),
       source: "runtime-gpt"
     }))
-    .filter((answer) => answer.field_id && answer.value);
+    .filter((answer) => answer.field_id && answer.value && !isRejectedRuntimeAnswerPlaceholder(answer.value));
+}
+
+function isRejectedRuntimeAnswerPlaceholder(value) {
+  return /^(?:not specified|unspecified|unknown|not provided|not available|no information(?: provided| available)?|information unavailable|to be determined|tbd)$/i
+    .test(String(value || "").trim());
 }
 
 function getOrderedRuntimeGptQueue() {
@@ -2415,7 +2452,13 @@ async function getSheetContextForPage(payload, sender) {
   const sheetSettings = normalizeSheetSettings(settings.sheetSettings || {});
   const sheetJobs = settings.sheetJobs || {};
   const tabContext = tabId ? settings.sheetTabJobs?.[tabId] : null;
-  if (!forceRefresh && tabContext?.rowNumber) return withSheetMatchSource(tabContext, "tab");
+  const normalizedPageUrl = normalizeUrlForMatch(url || alternateUrl);
+  const tabContextScore = tabContext?.url
+    ? scoreSheetContextUrlMatch(normalizeUrlForMatch(tabContext.url), normalizedPageUrl)
+    : 0;
+  if (!forceRefresh && tabContext?.rowNumber && tabContextScore >= 600) {
+    return withSheetMatchSource(tabContext, "tab");
+  }
 
   if (!forceRefresh) {
     const context = findSheetContext(sheetJobs, url) || findSheetContext(sheetJobs, alternateUrl);
@@ -2790,7 +2833,10 @@ function mergeProfileStaticFields(serverProfile, localProfile) {
 function matchStaticFieldKey(field) {
   const text = normalizeText([field.autocomplete, field.name, field.label, field.placeholder].join(" "));
   if (isLanguageYesNoField(field)) return null;
+  if (isCombinedLocationField(field)) return "location";
+  if (isSemanticBasedInQuestion(field)) return null;
   if (isPlainFullNameField(field)) return "full_name";
+  if (isPhoneStaticField(field)) return "phone";
   const addressComponentKey = matchAddressComponentFieldKey(field);
   if (addressComponentKey) return addressComponentKey;
   const patterns = [
@@ -2798,7 +2844,6 @@ function matchStaticFieldKey(field) {
     ["last_name", ["family name", "last name", "lastname", "surname", "last_name"]],
     ["full_name", ["full name", "your name", "applicant name"]],
     ["email", ["email", "e mail", "mail"]],
-    ["phone", ["phone", "mobile", "telephone", "cell"]],
     ["location", ["location", "address", "current city", "current location"]],
     ["city", ["city"]],
     ["country", ["country", "residence", "current residence", "where is your current residence", "where are you based"]],
@@ -2831,7 +2876,18 @@ function isPlainFullNameField(field) {
   const candidates = [field.label, field.name, field.autocomplete]
     .map(normalizeText)
     .filter(Boolean);
-  return candidates.some((candidate) => ["name", "your name", "applicant name", "candidate name", "full name"].includes(candidate));
+  return candidates.some((candidate) =>
+    ["name", "your name", "applicant name", "candidate name", "full name", "preferred name"].includes(candidate) ||
+    /\bfirst(?:\s+and|\s*\/)\s*last\s+name\b|\blast(?:\s+and|\s*\/)\s*first\s+name\b/.test(candidate)
+  );
+}
+
+function isCombinedLocationField(field) {
+  if (!isTextLikeStaticField(field)) return false;
+  const text = normalizeText([field.label, field.name, field.placeholder].filter(Boolean).join(" "));
+  if (!/(location|where.*based|based.*in|residence)/.test(text)) return false;
+  const parts = ["city", "state", "country"].filter((part) => new RegExp(`\\b${part}\\b`).test(text));
+  return parts.length >= 2 || /what location.*based|where.*(?:located|based|reside)/.test(text);
 }
 
 function isTextLikeStaticField(field) {
@@ -2846,13 +2902,31 @@ function isLanguageYesNoField(field) {
     options.includes("no");
 }
 
+function isSemanticBasedInQuestion(field) {
+  const text = normalizeText([field?.label, field?.name, field?.placeholder].filter(Boolean).join(" "));
+  return /(currently.*based.*in|based.*in|currently.*located.*in|located.*in|currently.*living.*in|currently.*residing.*in|resident.*in)/.test(text);
+}
+
+function isPhoneStaticField(field) {
+  const type = normalizeText(field?.type || "");
+  const autocomplete = normalizeText(field?.autocomplete || "");
+  const text = normalizeText([field?.name, field?.label, field?.placeholder].filter(Boolean).join(" "));
+  if (type === "tel" || /^(tel|phone|mobile)$/.test(autocomplete)) return true;
+  if (/\b(phone|telephone|cell)(?:\s+number)?\b/.test(text)) return true;
+  return /\bmobile\b/.test(text) && (
+    /\bmobile\s+(?:phone|number|contact)\b/.test(text) ||
+    /^(?:your\s+)?mobile(?:\s+number)?$/.test(text)
+  );
+}
+
 function getStaticFieldValue(staticFields, key) {
   const aliases = {
     postal_code: ["postal_code", "postalcode", "post_code", "postcode", "zip_code", "zipcode", "zip"],
     state_region: ["state_region", "state_province_region", "state_province", "state", "province", "region", "administrative_area"],
     expected_rate: ["expected_rate", "expected_salary", "salary_expectation", "salary_expectations", "monthly_salary", "monthly_salary_expectation", "desired_salary", "desired_compensation"],
     notice_period: ["notice_period", "current_notice_period", "availability_notice"],
-    languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"]
+    languages: ["languages", "language", "spoken_languages", "language_proficiency", "fluent_languages", "languages_spoken"],
+    work_authorization: ["work_authorization", "right_to_work", "work_status", "employment_status"]
   };
 
   if (key === "full_name") {
@@ -3044,7 +3118,7 @@ function findSheetContext(sheetJobs, pageUrl) {
       context,
       score: scoreSheetContextUrlMatch(url, normalized)
     })))
-    .filter((candidate) => candidate.score > 0)
+    .filter((candidate) => candidate.score >= 600)
     .sort((left, right) => right.score - left.score);
 
   return candidates[0] ? withSheetMatchSource(candidates[0].context, "url-fuzzy") : null;

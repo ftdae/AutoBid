@@ -85,10 +85,6 @@
         return { value: "PostgreSQL", reason: "database-default" };
       }
 
-      if (isAuthorizationSupportRequiredChoiceField(field, controls)) {
-        return { value: "No", reason: "authorization-support-not-required" };
-      }
-
       if (isAvailabilityDateField(field, controls)) {
         return { value: formatDateForControl(getNextMondayDate(), controls[0], field), reason: "next-monday" };
       }
@@ -137,14 +133,14 @@
       const control = controls?.[0];
       const type = getControlType(control);
       if (!["date", "text", "search"].includes(type)) return false;
-      const label = getFieldContextLabel(field, control);
+      const label = getDirectFieldLabel(field, control);
       return /(date available|available date|available start date|earliest.*start|start date|when.*start|availability date)/.test(label);
     }
 
     function getExperienceYearsDefault(field, controls) {
       const control = controls?.[0];
       const type = getControlType(control);
-      const label = getFieldContextLabel(field, control);
+      const label = getDirectFieldLabel(field, control);
       if (!isExperienceYearsLabel(label)) return null;
 
       const kind = getExperienceYearsKind(label);
@@ -174,8 +170,20 @@
       const control = controls?.[0];
       const type = getControlType(control);
       if (!["range", "number", "text"].includes(type)) return false;
-      const label = getFieldContextLabel(field, control);
+      const label = getDirectFieldLabel(field, control);
       return isExperienceYearsLabel(label);
+    }
+
+    function getDirectFieldLabel(field, control) {
+      return normalize([
+        field?.question,
+        field?.label,
+        field?.name,
+        field?.placeholder,
+        field?.autocomplete,
+        control?.getAttribute?.("aria-label"),
+        control?.getAttribute?.("placeholder")
+      ].filter(Boolean).join(" "));
     }
 
     function isExperienceYearsLabel(label) {
