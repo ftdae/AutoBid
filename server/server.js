@@ -14,6 +14,7 @@ import {
   disconnectOutlook,
   findLatestVerificationCode,
   getOutlookConnection,
+  getOutlookConfiguration,
   listVerificationMessages,
   markOutlookMessageRead
 } from "./outlook/microsoft-graph.js";
@@ -83,9 +84,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
+  const outlook = getOutlookConfiguration();
   logBackendEvent("BACKEND_STARTED", {
     url: `http://localhost:${PORT}`,
-    database_available: databaseAvailable
+    database_available: databaseAvailable,
+    outlook_configured: outlook.configured,
+    outlook_missing: outlook.missing
   });
 });
 
@@ -185,7 +189,11 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "POST" && pathname === "/api/auto-bid/outlook/oauth/start") {
-    const authorization = createOutlookAuthorization({ userId: user.id, redirectUri: body.redirect_uri });
+    const authorization = createOutlookAuthorization({
+      userId: user.id,
+      redirectUri: body.redirect_uri,
+      profileId: body.profile_id
+    });
     sendJson(res, 200, { data: authorization, errors: null });
     return;
   }
@@ -202,7 +210,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "DELETE" && pathname === "/api/auto-bid/outlook/connection") {
-    const connection = await disconnectOutlook(pool, user.id);
+    const connection = await disconnectOutlook(pool, user.id, url.searchParams.get("connection_id") || "");
     sendJson(res, 200, { data: connection, errors: null });
     return;
   }
@@ -210,7 +218,12 @@ async function handleRequest(req, res) {
   if (req.method === "GET" && pathname === "/api/auto-bid/outlook/messages") {
     const messages = await listVerificationMessages(pool, user.id, {
       top: url.searchParams.get("top"),
-      domain: url.searchParams.get("domain")
+      domain: url.searchParams.get("domain"),
+      since: url.searchParams.get("since"),
+      title: url.searchParams.get("title"),
+      page_url: url.searchParams.get("page_url"),
+      profile_id: url.searchParams.get("profile_id"),
+      mailbox_email: url.searchParams.get("mailbox_email")
     });
     sendJson(res, 200, { data: messages, errors: null });
     return;
@@ -219,7 +232,12 @@ async function handleRequest(req, res) {
   if (req.method === "GET" && pathname === "/api/auto-bid/outlook/latest-code") {
     const result = await findLatestVerificationCode(pool, user.id, {
       top: url.searchParams.get("top"),
-      domain: url.searchParams.get("domain")
+      domain: url.searchParams.get("domain"),
+      since: url.searchParams.get("since"),
+      title: url.searchParams.get("title"),
+      page_url: url.searchParams.get("page_url"),
+      profile_id: url.searchParams.get("profile_id"),
+      mailbox_email: url.searchParams.get("mailbox_email")
     });
     sendJson(res, 200, { data: result, errors: null });
     return;
@@ -227,7 +245,12 @@ async function handleRequest(req, res) {
 
   const outlookReadMatch = pathname.match(/^\/api\/auto-bid\/outlook\/messages\/([^/]+)\/read$/);
   if (req.method === "POST" && outlookReadMatch) {
-    const result = await markOutlookMessageRead(pool, user.id, decodeURIComponent(outlookReadMatch[1]));
+    const result = await markOutlookMessageRead(
+      pool,
+      user.id,
+      decodeURIComponent(outlookReadMatch[1]),
+      body.connection_id || url.searchParams.get("connection_id") || ""
+    );
     sendJson(res, 200, { data: result, errors: null });
     return;
   }

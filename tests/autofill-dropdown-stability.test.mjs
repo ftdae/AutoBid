@@ -35,6 +35,20 @@ test("a GPT delivery is finalized after one application pass and duplicate or st
   assert.match(backgroundSource, /const holdReason = `autofill-run:\$\{frameId\}:\$\{runId\}`/);
 });
 
+test("each application page shows a persistent spinning autofill stage indicator", () => {
+  const statusSource = contentSource.slice(
+    contentSource.indexOf("function showStatus"),
+    contentSource.indexOf("function hashSmall")
+  );
+  assert.match(contentSource, /showStatus\("Questions sent to GPT", "waiting"/);
+  assert.match(contentSource, /showStatus\("Autofilling GPT answers", "autofilling"/);
+  assert.match(contentSource, /"Autofill done"/);
+  assert.match(statusSource, /dataset\.autoBidStatusKind = kind/);
+  assert.match(statusSource, /icon\.animate\?\./);
+  assert.match(statusSource, /Dismiss Auto Bid status/);
+  assert.doesNotMatch(statusSource, /setTimeout\(\(\) => status\.remove/);
+});
+
 test("generated answers preserve every current manual value including choice controls", () => {
   const applySource = contentSource.slice(
     contentSource.indexOf("async function applyAnswers"),

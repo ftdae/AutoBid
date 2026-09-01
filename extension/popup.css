@@ -214,6 +214,7 @@ button.danger {
   min-height: 17px;
   margin: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .tabs {
@@ -347,13 +348,51 @@ button.danger {
   background: #f7f9f8;
 }
 
-.connection-identity {
+.connection-list {
   display: grid;
-  gap: 2px;
-  padding: 10px;
-  border-left: 3px solid #477ca8;
-  background: #f2f7fb;
+  gap: 7px;
   font-size: 12px;
+}
+
+.connection-account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid #d5e1dc;
+  border-left: 3px solid #477ca8;
+  border-radius: 6px;
+  background: #f2f7fb;
+}
+
+.connection-account.selected {
+  border-color: #6ca58e;
+  border-left-color: #227a5b;
+  background: #f0f8f4;
+}
+
+.connection-account-identity {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.connection-account-identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-profile {
+  color: #5f6d67;
+  font-size: 11px;
+}
+
+.compact-button {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  font-size: 11px;
 }
 
 .message-list,

@@ -52,6 +52,9 @@ const RESUME_FILE_INPUT_WAIT_MS = 2500;
 const RESUME_FILE_INPUT_RETRY_MS = 250;
 const RESUME_SERVER_CONFIRM_TIMEOUT_MS = 6000;
 const RESUME_MANAGED_UPLOAD_TIMEOUT_MS = 30000;
+const OUTLOOK_VERIFICATION_FIELD_WAIT_MS = 12000;
+const OUTLOOK_VERIFICATION_BUTTON_WAIT_MS = 8000;
+const OUTLOOK_VERIFICATION_LOOKBACK_MS = 4 * 60 * 1000;
 const CHOICE_FIELD_TYPES = ["select", "radio", "checkbox", "combobox", "button-group"];
 const PHONE_DIAL_CODES_BY_COUNTRY = {
   albania: "+355",
@@ -145,12 +148,15 @@ let lastNativeClickError = null;
 let autoBidTrace = [];
 let autoBidRunId = "";
 let autoBidRunStartedAt = "";
+let activeAutoBidProfileId = "";
+let activeAutoBidProfileEmail = "";
 let tracePublishTimer = null;
 const runtimeGptSourceFields = new Map();
 const runtimeGptAnswersByRequest = new Map();
 const runtimeGptApplyPromises = new Map();
 const finalizedRuntimeGptRequestIds = new Set();
 const generatedAnswerFillAttempts = new Map();
+const completedOutlookVerificationMessages = new Set();
 const atsAdapters = window.AutoBidAtsAdapters?.create({
   queryAll,
   isVisible,
@@ -186,6 +192,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       });
     return true;
   }
+  if (message?.type === "AUTO_BID_OUTLOOK_VERIFICATION_READY") {
+    const payload = message.payload || {};
+    completeOutlookVerification(payload)
+      .then((result) => sendResponse?.({ ok: true, ...result }))
+      .catch((error) => {
+        traceAutoBid("outlook-verification:completion-error", {
+          monitor_id: payload.monitor_id || "",
+          message_id: payload.message?.id || "",
+          message: error.message || String(error)
+        });
+        sendResponse?.({ ok: false, applied: false, error: error.message || String(error) });
+      });
+    return true;
+  }
   return false;
 });
 
@@ -203,7 +223,7 @@ async function runAutoBid() {
     frame: getFrameScope(),
     ats: atsAdapters?.describe?.() || { id: "common", name: "Common form" }
   });
-  showStatus("Auto Bid is filling this page...", "success");
+  showStatus("Scanning required fields", "working", { detail: "Preparing this application for autofill…" });
   await closeOpenChoiceMenus();
 
   let fields = collectFields();
@@ -235,6 +255,9 @@ async function runAutoBid() {
     const initiallyFilledIds = getCurrentlyFilledFieldIds(fields);
     traceAutoBid("fields:already-filled", { count: initiallyFilledIds.size, field_ids: Array.from(initiallyFilledIds) });
 
+    showStatus("Autofilling saved information", "autofilling", {
+      detail: "Filling known profile values before requesting generated answers…"
+    });
     const staticFallbackResult = await runStep("static-profile", () => applyProfileStaticFallbacks(fields, initiallyFilledIds), emptyFillResult());
     const locallyFilledIds = new Set([...initiallyFilledIds, ...staticFallbackResult.filledIds]);
     const localFallbackResult = await runStep("local-fallbacks", () => applyLocalGeneratedFallbacks(fields, locallyFilledIds), emptyFillResult());
@@ -313,10 +336,20 @@ async function runAutoBid() {
     const filled = staticFallbackResult.filled + localFallbackResult.filled + runtimeGptResult.filled + openAiResult.filled + profileReconcileResult.filled + runtimeGptReconcileResult.filled + finalDefaultResult.filled + resumeResult.filled;
     const missed = getMissingRequiredFields(collectFields()).length;
     traceAutoBid("run:complete", { filled, missed, runtime_gpt: runtimeGptResult, openai: openAiResult, profile_reconcile: profileReconcileResult, runtime_gpt_reconcile: runtimeGptReconcileResult, final_defaults: finalDefaultResult, resume: resumeResult, submit: submitResult });
-    showStatus(submitResult.clicked ? "Filled and submitted application." : `Filled ${filled} fields. ${missed} skipped.`, filled || resumeResult.filled ? "success" : "error");
+    showStatus(
+      submitResult.clicked ? "Application submitted" : missed > 0 ? "Autofill finished" : "Autofill done",
+      submitResult.clicked || missed === 0 ? "success" : "warning",
+      {
+        detail: submitResult.clicked
+          ? "Required fields were completed and the application was submitted."
+          : missed > 0
+            ? `${missed} required field${missed === 1 ? " is" : "s are"} still empty. Press Ctrl+Q to retry only those fields.`
+            : "All detected required fields are complete."
+      }
+    );
   } catch (error) {
     traceAutoBid("run:error", { message: error.message || String(error) });
-    showStatus(error.message || String(error), "error");
+    showStatus("Autofill stopped", "error", { detail: error.message || String(error) });
   } finally {
     flushTrace();
     autoBidRunning = false;
@@ -472,17 +505,28 @@ async function applyOutlookVerificationAnswers(fields, filledIds) {
 
   let verification;
   try {
+    if (!activeAutoBidProfileId) {
+      const profileStatic = await send("GET_PROFILE_STATIC_FIELDS");
+      captureAutoBidProfileContext(profileStatic);
+    }
     verification = await send("OUTLOOK_FIND_VERIFICATION", {
       domain: location.hostname.replace(/^www\./, ""),
+      page_url: location.href,
       title: document.title || "",
-      top: 10
+      since: new Date(Date.now() - OUTLOOK_VERIFICATION_LOOKBACK_MS).toISOString(),
+      top: 10,
+      profile_id: activeAutoBidProfileId,
+      mailbox_email: activeAutoBidProfileEmail
     });
   } catch (error) {
     traceAutoBid("outlook-verification:unavailable", { message: error.message || String(error) });
     return result;
   }
   if (!verification?.code) {
-    traceAutoBid("outlook-verification:no-code", { candidates: candidates.map((field) => field.id) });
+    traceAutoBid("outlook-verification:no-code", {
+      reason: verification?.reason || "not-found",
+      candidates: candidates.map((field) => field.id)
+    });
     return result;
   }
 
@@ -502,7 +546,10 @@ async function applyOutlookVerificationAnswers(fields, filledIds) {
     }
   }
   if (result.filled > 0 && verification.message?.id) {
-    send("OUTLOOK_MARK_READ", { messageId: verification.message.id }).catch(() => {});
+    send("OUTLOOK_MARK_READ", {
+      messageId: verification.message.id,
+      connection_id: verification.message.connection_id || ""
+    }).catch(() => {});
   }
   return result;
 }
@@ -512,6 +559,158 @@ function isOutlookVerificationCodeField(field) {
   if (/(postal|zip|country|dial|phone|promo|coupon|referral)/.test(text)) return false;
   return /(verification|security|confirmation|one time|otp|passcode|authentication)\s*(code|pin|number)?/.test(text) ||
     /\b(code|pin)\b/.test(text) && /(email|account|application|verify|confirm)/.test(text);
+}
+
+async function completeOutlookVerification(payload = {}) {
+  const code = String(payload.code || "").replace(/[^a-z0-9]/gi, "");
+  const messageId = String(payload.message?.id || payload.message_id || "");
+  const monitorId = String(payload.monitor_id || "");
+  const completionKeys = [messageId, monitorId].filter(Boolean);
+  if (!/^\w{4,10}$/i.test(code) || !/\d/.test(code)) {
+    return { applied: false, clicked: false, reason: "invalid-verification-code" };
+  }
+  if (completionKeys.some((key) => completedOutlookVerificationMessages.has(key))) {
+    return { applied: true, clicked: false, settled: true, reason: "already-completed" };
+  }
+
+  showStatus("Verification code received", "autofilling", {
+    detail: "Filling the email verification step and confirming it once…"
+  });
+  const candidates = await waitForOutlookVerificationCodeFields();
+  if (candidates.length === 0) {
+    traceAutoBid("outlook-verification:field-not-ready", {
+      monitor_id: payload.monitor_id || "",
+      message_id: messageId
+    });
+    return { applied: false, clicked: false, reason: "verification-field-not-ready" };
+  }
+
+  const controls = uniqueElements(candidates.flatMap((field) => getControlsByFieldId(field.id)));
+  const alreadyApplied = controls.some((control) => normalizeComparableValue(control.value) === normalizeComparableValue(code));
+  const hasDifferentManualValue = !alreadyApplied && controls.some((control) => String(control.value || "").trim());
+  if (hasDifferentManualValue) {
+    traceAutoBid("outlook-verification:manual-value-preserved", {
+      monitor_id: payload.monitor_id || "",
+      message_id: messageId
+    });
+    return { applied: false, clicked: false, settled: true, reason: "manual-value-preserved" };
+  }
+  const applied = alreadyApplied || await applyOutlookVerificationCode(candidates, controls, code);
+  if (!applied) {
+    traceAutoBid("outlook-verification:code-fill-failed", {
+      monitor_id: payload.monitor_id || "",
+      message_id: messageId,
+      fields: candidates.map((field) => field.id)
+    });
+    return { applied: false, clicked: false, reason: "verification-code-fill-failed" };
+  }
+
+  completionKeys.forEach((key) => completedOutlookVerificationMessages.add(key));
+  const button = await waitForOutlookVerificationSubmitButton(controls);
+  let clicked = false;
+  if (button && !isDisabledSubmitButton(button)) {
+    await scrollElementIntoView(button, "center");
+    await sleep(150);
+    clicked = await nativeClickElement(button);
+    if (!clicked) {
+      dispatchRealisticMouseClick(button);
+      clicked = true;
+    }
+  }
+
+  traceAutoBid("outlook-verification:completed", {
+    monitor_id: payload.monitor_id || "",
+    message_id: messageId,
+    applied,
+    clicked,
+    button: button ? getSubmitButtonText(button) : ""
+  });
+  showStatus(clicked ? "Email verification submitted" : "Verification code filled", clicked ? "success" : "warning", {
+    detail: clicked
+      ? "The code was filled and the verification button was clicked once."
+      : "The code was filled once, but no safe verification button was found."
+  });
+  return { applied: true, clicked, settled: true, reason: clicked ? "verification-submitted" : "button-not-found" };
+}
+
+async function waitForOutlookVerificationCodeFields(timeoutMs = OUTLOOK_VERIFICATION_FIELD_WAIT_MS) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const candidates = collectFields().filter((field) =>
+      isOutlookVerificationCodeField(field) &&
+      getControlsByFieldId(field.id).some((control) => isVisible(control))
+    );
+    if (candidates.length > 0) return candidates;
+    await sleep(300);
+  }
+  return [];
+}
+
+async function applyOutlookVerificationCode(fields, controls, code) {
+  const textControls = controls.filter((control) => {
+    const type = getControlType(control);
+    return ["text", "number", "tel"].includes(type) || control.getAttribute?.("inputmode") === "numeric";
+  });
+  const segmented = textControls.length >= code.length &&
+    textControls.slice(0, code.length).every((control) => Number(control.maxLength || control.getAttribute?.("maxlength") || 0) === 1);
+  if (segmented) {
+    for (let index = 0; index < code.length; index += 1) {
+      const control = textControls[index];
+      control.focus?.({ preventScroll: true });
+      setNativeValue(control, code[index]);
+      dispatchInput(control);
+    }
+    textControls[Math.min(code.length, textControls.length) - 1]?.blur?.();
+    await sleep(200);
+    return textControls.slice(0, code.length).map((control) => String(control.value || "")).join("") === code;
+  }
+
+  for (const field of fields) {
+    const fieldControls = getControlsByFieldId(field.id);
+    if (fieldControls.length === 0) continue;
+    if (await setControlsValue(fieldControls, code, field)) return true;
+  }
+  return false;
+}
+
+async function waitForOutlookVerificationSubmitButton(controls, timeoutMs = OUTLOOK_VERIFICATION_BUTTON_WAIT_MS) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const button = findOutlookVerificationSubmitButton(controls);
+    if (button && !isDisabledSubmitButton(button)) return button;
+    await sleep(300);
+  }
+  return findOutlookVerificationSubmitButton(controls);
+}
+
+function findOutlookVerificationSubmitButton(controls) {
+  const roots = uniqueElements(controls.flatMap((control) => [
+    control.closest?.("form"),
+    control.closest?.("[role='dialog'], main, section, article, [class*='verification' i], [class*='confirm' i]"),
+    document.body
+  ].filter(Boolean)));
+  const candidates = uniqueElements(roots.flatMap((root) =>
+    queryAll("button, input[type='submit'], input[type='button'], [role='button']", root)
+  )).filter((element) => isVisible(element) && !isDisabledSubmitButton(element))
+    .map((element) => ({ element, text: normalize(getSubmitButtonText(element)) }))
+    .filter(({ text }) => text && !/(resend|send again|new code|change email|cancel|back|previous)/.test(text))
+    .map((candidate) => ({ ...candidate, score: scoreOutlookVerificationButton(candidate.text) }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+  return candidates[0]?.element || null;
+}
+
+function scoreOutlookVerificationButton(text) {
+  if (/^(verify|verify code|confirm|confirm code|submit code)$/.test(text)) return 140;
+  if (/(verify|verification|confirm).*(email|code|application)|(email|code|application).*(verify|confirm)/.test(text)) return 130;
+  if (/(complete|finish).*(application|verification)/.test(text)) return 120;
+  if (/^(submit|continue|send)$/.test(text)) return 90;
+  if (/(submit|continue|send).*(application|verification|code)/.test(text)) return 80;
+  return 0;
+}
+
+function uniqueElements(values) {
+  return Array.from(new Set((values || []).filter(Boolean)));
 }
 
 async function applyDirectAiAnswers(fields, filledIds) {
@@ -2205,6 +2404,7 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
 
   try {
     profileStatic = await send("GET_PROFILE_STATIC_FIELDS");
+    captureAutoBidProfileContext(profileStatic);
   } catch (error) {
     traceAutoBid("profile-static:error", { message: error.message || String(error) });
     return { filled: 0, missed: 0, filledIds: filledLocalIds };
@@ -2302,6 +2502,13 @@ async function applyProfileStaticFallbacks(fields, filledIds) {
   });
 
   return { filled, missed, filledIds: filledLocalIds };
+}
+
+function captureAutoBidProfileContext(profileStatic) {
+  if (!activeAutoBidProfileId) activeAutoBidProfileId = String(profileStatic?.profile_id || "");
+  if (!activeAutoBidProfileEmail) {
+    activeAutoBidProfileEmail = String(profileStatic?.static_fields?.email || "").trim().toLowerCase();
+  }
 }
 
 function getProfileAddressFillPriority(field) {
@@ -3637,6 +3844,9 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
     return { filled: 0, missed: 0, pending: 0, filledIds: localFilledIds };
   }
 
+  showStatus("Preparing GPT questions", "working", {
+    detail: "Reading candidate values from required selects, radios, and dropdowns…"
+  });
   await hydrateGeneratedChoiceOptions(candidateFields);
   const unresolvedCandidateFields = candidateFields.filter((field) => !hasFieldCurrentValue(field));
   const incompleteChoiceFields = unresolvedCandidateFields.filter((field) => !hasCompleteGeneratedChoiceOptions(field));
@@ -3705,7 +3915,9 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
 
   const requestId = request?.request_id || request?.requestId || "";
   if (requestId) runtimeGptSourceFields.set(requestId, remaining.map((field) => ({ ...field })));
-  showStatus(`Sent ${remaining.length} question${remaining.length === 1 ? "" : "s"} to ChatGPT worker`, "success");
+  showStatus("Questions sent to GPT", "waiting", {
+    detail: `Waiting for ${remaining.length} required answer${remaining.length === 1 ? "" : "s"}…`
+  });
 
   const status = await waitForRuntimeGptAnswer(requestId);
   if (!isActiveContentInstance()) {
@@ -3747,6 +3959,9 @@ async function applyRuntimeGptAnswerExchange(fields, filledIds) {
     }))
   });
 
+  showStatus("Autofilling GPT answers", "autofilling", {
+    detail: `${answers.length} answer${answers.length === 1 ? " was" : "s were"} received and will be applied once…`
+  });
   const result = await applyRuntimeGptAnswersOnce(requestId, answers, remaining, activeFilledIds);
   result.filledIds.forEach((fieldId) => localFilledIds.add(fieldId));
   remaining = requestableFields.filter((field) => !result.filledIds.has(field.id) && !hasFieldCurrentValue(field));
@@ -3800,6 +4015,9 @@ async function applyPushedRuntimeGptAnswers(payload) {
   });
   if (answers.length === 0) return emptyFillResult();
 
+  showStatus("Autofilling GPT answers", "autofilling", {
+    detail: `${answers.length} answer${answers.length === 1 ? " was" : "s were"} received and will be applied once…`
+  });
   const result = await applyRuntimeGptAnswersOnce(requestId, answers);
   const settlement = getRuntimeGptAnswerSettlement(requestId);
   traceAutoBid("runtime-gpt:push-applied", {
@@ -3815,6 +4033,17 @@ async function applyPushedRuntimeGptAnswers(payload) {
     }).catch(() => {});
   }
   flushTrace();
+  if (!autoBidRunning) {
+    showStatus(
+      result.missed > 0 ? "Autofill finished" : "Autofill done",
+      result.missed > 0 ? "warning" : "success",
+      {
+        detail: result.missed > 0
+          ? `${result.missed} required field${result.missed === 1 ? " is" : "s are"} still empty. Press Ctrl+Q to retry.`
+          : "The GPT answers were applied once. Manual changes will be preserved."
+      }
+    );
+  }
   return {
     filled: Number(result.filled || 0),
     missed: Number(result.missed || 0),
@@ -4009,6 +4238,28 @@ async function maybeAutoSubmitApplication(fields, sheetResult, resumeResult) {
     return { clicked: false, reason: "button-disabled", text: getSubmitButtonText(button) };
   }
 
+  const submissionStartedAt = new Date().toISOString();
+  let verificationMonitor = null;
+  try {
+    verificationMonitor = await promiseWithTimeout(send("OUTLOOK_MONITOR_START", {
+      since: submissionStartedAt,
+      page_url: location.href,
+      domain: location.hostname.replace(/^www\./, ""),
+      title: document.title || "",
+      run_id: autoBidRunId,
+      profile_id: activeAutoBidProfileId,
+      mailbox_email: activeAutoBidProfileEmail,
+      submit_text: getSubmitButtonText(button)
+    }), 2500, "Outlook verification monitor setup timed out");
+    traceAutoBid("outlook-verification:monitor-start", {
+      started: Boolean(verificationMonitor?.started),
+      reason: verificationMonitor?.reason || "",
+      monitor_id: verificationMonitor?.monitor_id || ""
+    });
+  } catch (error) {
+    traceAutoBid("outlook-verification:monitor-unavailable", { message: error.message || String(error) });
+  }
+
   await scrollElementIntoView(button, "center");
   await sleep(250);
   let clicked = await nativeClickElement(button);
@@ -4018,12 +4269,35 @@ async function maybeAutoSubmitApplication(fields, sheetResult, resumeResult) {
   }
   await sleep(600);
 
+  if (clicked && verificationMonitor?.started && verificationMonitor.monitor_id) {
+    send("OUTLOOK_MONITOR_ARM", { monitor_id: verificationMonitor.monitor_id }).catch((error) => {
+      traceAutoBid("outlook-verification:monitor-arm-error", {
+        monitor_id: verificationMonitor.monitor_id,
+        message: error.message || String(error)
+      });
+    });
+    announceOutlookVerificationWait(verificationMonitor.monitor_id).catch(() => {});
+  }
+
   traceAutoBid("submit:clicked", {
     clicked: Boolean(clicked),
     text: getSubmitButtonText(button)
   });
 
-  return { clicked: Boolean(clicked), reason: clicked ? "submitted" : "click-failed", text: getSubmitButtonText(button) };
+  return {
+    clicked: Boolean(clicked),
+    reason: clicked ? "submitted" : "click-failed",
+    text: getSubmitButtonText(button),
+    verification_monitor: verificationMonitor?.started ? verificationMonitor.monitor_id : ""
+  };
+}
+
+async function announceOutlookVerificationWait(monitorId) {
+  const candidates = await waitForOutlookVerificationCodeFields(8000);
+  if (candidates.length === 0 || completedOutlookVerificationMessages.has(monitorId)) return;
+  showStatus("Waiting for Outlook verification code", "waiting", {
+    detail: "The application requested email verification. Auto Bid is watching the connected mailbox in the background."
+  });
 }
 
 async function triggerSheetGptAnswerWorker(context) {
@@ -7324,6 +7598,8 @@ function resetTrace() {
   generatedAnswerFillAttempts.clear();
   autoBidRunId = `abr_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   autoBidRunStartedAt = new Date().toISOString();
+  activeAutoBidProfileId = "";
+  activeAutoBidProfileEmail = "";
   document.documentElement.removeAttribute(DEBUG_ATTR);
   publishTraceSnapshot("running");
 }
@@ -7551,7 +7827,7 @@ function scoreChoice(choice, answer) {
   return Math.round((intersection.length / Math.max(choiceWords.size, answerWords.size)) * 60);
 }
 
-function showStatus(message, kind) {
+function showStatus(message, kind = "working", options = {}) {
   if (!isActiveContentInstance()) return;
   let status = document.getElementById(STATUS_ID);
   if (!status) {
@@ -7560,22 +7836,115 @@ function showStatus(message, kind) {
     document.documentElement.append(status);
   }
 
-  status.textContent = message;
-  status.style.cssText = [
-    "position:fixed",
-    "right:18px",
-    "top:18px",
-    "z-index:2147483647",
-    "max-width:min(360px, calc(100vw - 36px))",
-    "padding:10px 12px",
-    "border-radius:8px",
-    "font:13px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-    "box-shadow:0 14px 40px rgba(19,35,29,.22)",
-    kind === "error" ? "background:#fff7ed;color:#9a3412;border:1px solid #fdba74" : "background:#ecfdf5;color:#065f46;border:1px solid #86efac"
-  ].join(";");
+  const detail = typeof options === "string" ? options : String(options.detail || "");
+  const active = ["working", "waiting", "autofilling", "progress"].includes(kind);
+  const palette = kind === "error"
+    ? { background: "#fff7ed", border: "#fdba74", text: "#9a3412", icon: "#c2410c" }
+    : kind === "warning"
+      ? { background: "#fffbeb", border: "#fcd34d", text: "#92400e", icon: "#d97706" }
+      : kind === "waiting"
+        ? { background: "#eff6ff", border: "#93c5fd", text: "#1e3a8a", icon: "#2563eb" }
+        : { background: "#ecfdf5", border: "#86efac", text: "#065f46", icon: "#059669" };
 
   window.clearTimeout(status._autoBidTimer);
-  status._autoBidTimer = window.setTimeout(() => status.remove(), kind === "error" ? 6000 : 2600);
+  status.replaceChildren();
+  status.dataset.autoBidStatusKind = kind;
+  status.setAttribute("role", kind === "error" ? "alert" : "status");
+  status.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
+  status.style.cssText = [
+    "position:fixed",
+    "right:16px",
+    "top:16px",
+    "z-index:2147483647",
+    "display:flex",
+    "align-items:flex-start",
+    "gap:10px",
+    "width:min(320px, calc(100vw - 32px))",
+    "box-sizing:border-box",
+    "padding:11px 12px",
+    "border-radius:12px",
+    "font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    `background:${palette.background}`,
+    `color:${palette.text}`,
+    `border:1px solid ${palette.border}`,
+    "box-shadow:0 14px 40px rgba(19,35,29,.20)",
+    "pointer-events:auto"
+  ].join(";");
+
+  const icon = document.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  if (active) {
+    icon.style.cssText = [
+      "flex:0 0 auto",
+      "width:16px",
+      "height:16px",
+      "margin-top:2px",
+      "box-sizing:border-box",
+      "border-radius:999px",
+      `border:2px solid ${palette.border}`,
+      `border-top-color:${palette.icon}`
+    ].join(";");
+    icon.animate?.(
+      [{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }],
+      { duration: 750, iterations: Infinity, easing: "linear" }
+    );
+  } else {
+    icon.textContent = kind === "error" ? "!" : kind === "warning" ? "!" : "✓";
+    icon.style.cssText = [
+      "display:inline-flex",
+      "align-items:center",
+      "justify-content:center",
+      "flex:0 0 auto",
+      "width:18px",
+      "height:18px",
+      "margin-top:1px",
+      "border-radius:999px",
+      `background:${palette.icon}`,
+      "color:#fff",
+      "font:700 12px/1 system-ui,sans-serif"
+    ].join(";");
+  }
+
+  const content = document.createElement("span");
+  content.style.cssText = "display:block;min-width:0;flex:1";
+
+  const brand = document.createElement("span");
+  brand.textContent = "AUTO BID";
+  brand.style.cssText = "display:block;margin-bottom:1px;font:700 9px/1.3 Inter,system-ui,sans-serif;letter-spacing:.11em;opacity:.68";
+
+  const title = document.createElement("span");
+  title.textContent = String(message || "Autofill status");
+  title.style.cssText = "display:block;font:700 13px/1.35 Inter,system-ui,sans-serif";
+
+  content.append(brand, title);
+  if (detail) {
+    const description = document.createElement("span");
+    description.textContent = detail;
+    description.style.cssText = "display:block;margin-top:2px;font:500 11.5px/1.4 Inter,system-ui,sans-serif;opacity:.82";
+    content.append(description);
+  }
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "×";
+  close.setAttribute("aria-label", "Dismiss Auto Bid status");
+  close.style.cssText = [
+    "flex:0 0 auto",
+    "width:20px",
+    "height:20px",
+    "margin:-4px -5px 0 0",
+    "padding:0",
+    "border:0",
+    "border-radius:6px",
+    "background:transparent",
+    "color:inherit",
+    "font:600 18px/18px system-ui,sans-serif",
+    "cursor:pointer",
+    "opacity:.58"
+  ].join(";");
+  close.addEventListener("click", () => status.remove(), { once: true });
+
+  status.append(icon, content, close);
 }
 
 function hashSmall(value) {

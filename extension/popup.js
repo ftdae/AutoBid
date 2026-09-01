@@ -58,7 +58,6 @@ const els = {
   outlookIdentity: document.getElementById("outlookIdentity"),
   outlookStatus: document.getElementById("outlookStatus"),
   connectOutlookButton: document.getElementById("connectOutlookButton"),
-  disconnectOutlookButton: document.getElementById("disconnectOutlookButton"),
   refreshOutlookButton: document.getElementById("refreshOutlookButton"),
   outlookMessagesSection: document.getElementById("outlookMessagesSection"),
   outlookMessages: document.getElementById("outlookMessages"),
@@ -87,7 +86,6 @@ els.openOptionsButton?.addEventListener("click", () => {
   send("OPEN_OPTIONS").catch((error) => setStatus(error.message));
 });
 els.connectOutlookButton.addEventListener("click", connectOutlook);
-els.disconnectOutlookButton.addEventListener("click", disconnectOutlook);
 els.refreshOutlookButton.addEventListener("click", () => loadOutlookMessages(true));
 document.querySelectorAll("[data-view]").forEach((button) => {
   button.addEventListener("click", () => setActiveView(button.dataset.view));
@@ -237,12 +235,14 @@ async function selectProfile() {
   settings = await send("SELECT_PROFILE", null, { profileId });
   currentProfile = profiles.find((profile) => profile.id === profileId) || null;
   renderProfileForm();
+  renderOutlookConnection();
 }
 
 function newProfile() {
   currentProfile = null;
   renderProfileSelect();
   renderProfileForm();
+  renderOutlookConnection();
   els.profileName.focus();
 }
 
@@ -382,7 +382,7 @@ async function refreshOutlookConnection(loadMessages = false) {
     outlookConnection = await send("OUTLOOK_STATUS");
     renderOutlookConnection();
     if (loadMessages && outlookConnection?.connected) await loadOutlookMessages(false);
-    else setOutlookStatus(outlookConnection?.configured ? "" : "Microsoft OAuth is not configured on the API server.");
+    else setOutlookStatus(outlookConnection?.configured ? "" : formatOutlookSetupMessage(outlookConnection));
   } catch (error) {
     outlookConnection = { connected: false, configured: false, error: error.message };
     renderOutlookConnection();
@@ -396,18 +396,27 @@ async function connectOutlook() {
     outlookConnection = await send("OUTLOOK_CONNECT");
     renderOutlookConnection();
     await loadOutlookMessages(false);
-    setOutlookStatus("Outlook connected");
+    const connected = getOutlookConnections().find((item) => item.profile_id === currentProfile?.id);
+    setOutlookStatus(connected
+      ? `${connected.email || "Outlook mailbox"} is connected to ${currentProfile?.name || "this profile"}.`
+      : "Outlook connected");
   });
 }
 
-async function disconnectOutlook() {
-  if (!window.confirm("Disconnect this Outlook mailbox from Auto Bid?")) return;
-  await send("OUTLOOK_DISCONNECT");
-  outlookConnection = { connected: false, configured: true };
-  outlookMessages = [];
-  renderOutlookConnection();
-  renderOutlookMessages();
-  setOutlookStatus("Outlook disconnected");
+async function disconnectOutlook(connection, button) {
+  const label = connection.email || connection.display_name || "this Outlook mailbox";
+  if (!window.confirm(`Disconnect ${label} from ${connection.profile_name || "Auto Bid"}?`)) return;
+  button.disabled = true;
+  try {
+    outlookConnection = await send("OUTLOOK_DISCONNECT", { connection_id: connection.id });
+    outlookMessages = outlookMessages.filter((message) => message.connection_id !== connection.id);
+    renderOutlookConnection();
+    renderOutlookMessages();
+    setOutlookStatus(`${label} disconnected`);
+  } catch (error) {
+    button.disabled = false;
+    setOutlookStatus(error.message);
+  }
 }
 
 async function loadOutlookMessages(showMessage) {
@@ -427,24 +436,58 @@ async function loadOutlookMessages(showMessage) {
 }
 
 function renderOutlookConnection() {
-  const connected = Boolean(outlookConnection?.connected);
+  const connections = getOutlookConnections();
+  const connected = connections.length > 0;
   const configured = outlookConnection?.configured !== false;
   els.outlookState.className = `state-badge ${connected ? "connected" : "idle"}`;
-  els.outlookState.textContent = connected ? "Connected" : configured ? "Not connected" : "Needs setup";
-  els.connectOutlookButton.classList.toggle("hidden", connected);
-  els.connectOutlookButton.disabled = !configured;
-  els.disconnectOutlookButton.classList.toggle("hidden", !connected);
+  els.outlookState.textContent = connected
+    ? `${connections.length} connected`
+    : configured ? "Not connected" : "Needs setup";
+  const selectedConnection = connections.find((item) => item.profile_id === currentProfile?.id);
+  els.connectOutlookButton.classList.remove("hidden");
+  els.connectOutlookButton.disabled = !configured || !currentProfile;
+  els.connectOutlookButton.textContent = !currentProfile
+    ? "Select a profile first"
+    : selectedConnection
+      ? `Replace Outlook for ${currentProfile.name}`
+      : `Connect Outlook for ${currentProfile.name}`;
   els.refreshOutlookButton.classList.toggle("hidden", !connected);
   els.outlookIdentity.classList.toggle("hidden", !connected);
   els.outlookMessagesSection.classList.toggle("hidden", !connected);
   if (connected) {
-    els.outlookIdentity.replaceChildren(
-      createElement("strong", "", outlookConnection.display_name || outlookConnection.email || "Microsoft account"),
-      createElement("span", "", outlookConnection.email || "")
-    );
+    els.outlookIdentity.replaceChildren(...connections.map((connection) => {
+      const account = document.createElement("article");
+      account.className = `connection-account${connection.profile_id === currentProfile?.id ? " selected" : ""}`;
+      const identity = document.createElement("div");
+      identity.className = "connection-account-identity";
+      identity.append(
+        createElement("strong", "", connection.display_name || connection.email || "Microsoft account"),
+        createElement("span", "", connection.email || ""),
+        createElement("span", "connection-profile", connection.profile_name
+          ? `Profile: ${connection.profile_name}`
+          : "Legacy connection — reconnect it to a profile")
+      );
+      const disconnectButton = createElement("button", "danger compact-button", "Disconnect");
+      disconnectButton.addEventListener("click", () => disconnectOutlook(connection, disconnectButton));
+      account.append(identity, disconnectButton);
+      return account;
+    }));
   } else {
     els.outlookIdentity.replaceChildren();
   }
+}
+
+function getOutlookConnections() {
+  if (Array.isArray(outlookConnection?.connections)) return outlookConnection.connections;
+  return outlookConnection?.connected && outlookConnection?.id ? [outlookConnection] : [];
+}
+
+function formatOutlookSetupMessage(connection = {}) {
+  const missing = Array.isArray(connection.missing) && connection.missing.length
+    ? connection.missing.join(" and ")
+    : "MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET";
+  const redirect = connection.redirect_uri || "the Chrome identity redirect shown after reloading the extension";
+  return `Backend setup required: add ${missing} to .env, register this Web redirect URI in Microsoft Entra, then restart the server:\n${redirect}`;
 }
 
 function renderOutlookMessages() {
@@ -460,7 +503,11 @@ function renderOutlookMessages() {
     item.className = "message-item";
     item.append(
       createElement("h3", "", message.subject || "Verification message"),
-      createElement("div", "message-meta", `${message.from?.name || message.from?.address || "Unknown sender"} · ${formatDateTime(message.received_at)}`)
+      createElement("div", "message-meta", [
+        message.mailbox_email ? `Mailbox: ${message.mailbox_email}` : "",
+        message.from?.name || message.from?.address || "Unknown sender",
+        formatDateTime(message.received_at)
+      ].filter(Boolean).join(" · "))
     );
     if (message.preview) item.append(createElement("p", "message-meta", message.preview));
 
@@ -494,7 +541,10 @@ function renderOutlookMessages() {
     if (!message.is_read) {
       const readButton = createElement("button", "", "Mark read");
       readButton.addEventListener("click", async () => {
-        await send("OUTLOOK_MARK_READ", { messageId: message.id });
+        await send("OUTLOOK_MARK_READ", {
+          messageId: message.id,
+          connection_id: message.connection_id || ""
+        });
         message.is_read = true;
         renderOutlookMessages();
       });

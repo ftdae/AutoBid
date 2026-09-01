@@ -89,6 +89,35 @@ export async function ensureSchema(pool) {
       updated_at timestamptz not null default now()
     );
 
+    create table if not exists auto_bid_outlook_mailboxes (
+      id text primary key,
+      user_id text not null references auto_bid_users(id) on delete cascade,
+      profile_id text references auto_bid_profiles(id) on delete set null,
+      microsoft_user_id text not null,
+      tenant_id text,
+      email text,
+      display_name text,
+      access_token_encrypted text not null,
+      refresh_token_encrypted text not null,
+      token_expires_at timestamptz not null,
+      scopes text[] not null default '{}',
+      active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    insert into auto_bid_outlook_mailboxes
+      (id, user_id, profile_id, microsoft_user_id, tenant_id, email, display_name,
+       access_token_encrypted, refresh_token_encrypted, token_expires_at, scopes,
+       active, created_at, updated_at)
+    select
+      'abo_legacy_' || substr(md5(user_id || ':' || microsoft_user_id), 1, 24),
+      user_id, null, microsoft_user_id, tenant_id, email, display_name,
+      access_token_encrypted, refresh_token_encrypted, token_expires_at, scopes,
+      active, created_at, updated_at
+    from auto_bid_outlook_connections
+    on conflict (id) do nothing;
+
     create index if not exists auto_bid_profiles_user_active_idx on auto_bid_profiles(user_id, active);
     create index if not exists auto_bid_questions_domain_scope_idx on auto_bid_questions(domain, cache_scope);
     create index if not exists auto_bid_answer_cache_question_scope_idx on auto_bid_answer_cache(question_hash, cache_scope, created_at desc);
@@ -96,5 +125,9 @@ export async function ensureSchema(pool) {
     create index if not exists auto_bid_drafts_user_created_idx on auto_bid_application_drafts(user_id, created_at desc);
     create index if not exists auto_bid_drafts_profile_created_idx on auto_bid_application_drafts(profile_id, created_at desc);
     create index if not exists auto_bid_outlook_connections_active_idx on auto_bid_outlook_connections(active, updated_at desc);
+    create index if not exists auto_bid_outlook_mailboxes_user_active_idx on auto_bid_outlook_mailboxes(user_id, active, updated_at desc);
+    create index if not exists auto_bid_outlook_mailboxes_profile_idx on auto_bid_outlook_mailboxes(user_id, profile_id, active);
+    create unique index if not exists auto_bid_outlook_mailboxes_profile_account_idx
+      on auto_bid_outlook_mailboxes(user_id, microsoft_user_id, coalesce(profile_id, ''));
   `);
 }

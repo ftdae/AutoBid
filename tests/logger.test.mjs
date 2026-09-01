@@ -8,6 +8,7 @@ test("backend logs redact secrets and truncate large values", () => {
     api_key: "do-not-print",
     nested: {
       authorization: "Bearer private",
+      verification_code: "482913",
       page_text: "x".repeat(900)
     },
     answers: Array.from({ length: 35 }, (_, index) => ({ field_id: `field_${index}` }))
@@ -16,6 +17,7 @@ test("backend logs redact secrets and truncate large values", () => {
   assert.equal(safe.password, "[REDACTED]");
   assert.equal(safe.api_key, "[REDACTED]");
   assert.equal(safe.nested.authorization, "[REDACTED]");
+  assert.equal(safe.nested.verification_code, "[REDACTED]");
   assert.match(safe.nested.page_text, /more chars/);
   assert.equal(safe.answers.length, 31);
   assert.equal(safe.answers.at(-1), "[5 more items]");

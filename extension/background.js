@@ -29,6 +29,10 @@ const RUNTIME_GPT_RETRY_DELAY_MS = 5000;
 const RUNTIME_GPT_DELIVERY_ATTEMPTS = 3;
 const RUNTIME_GPT_DELIVERY_RETRY_MS = 1000;
 const RUNTIME_GPT_DELIVERY_ALARM_PREFIX = "autobid-gpt-delivery:";
+const OUTLOOK_VERIFICATION_MONITORS_STORAGE_KEY = "autoBidOutlookVerificationMonitorsV1";
+const OUTLOOK_VERIFICATION_ALARM = "autobid-outlook-verification";
+const OUTLOOK_VERIFICATION_MONITOR_TTL_MS = 4 * 60 * 1000;
+const OUTLOOK_VERIFICATION_POLL_MS = 4000;
 const AUTO_BID_WINDOW_SIZE = { width: 500, height: 760 };
 const AUTO_BID_WINDOW_EDGE_GAP = 24;
 const nativeInputQueues = new Map();
@@ -44,6 +48,9 @@ let runtimeGptRequestsLoadPromise = null;
 let runtimeGptPersistPromise = Promise.resolve();
 let nextRuntimeGptQueueSequence = 1;
 let executionLogWritePromise = Promise.resolve();
+let outlookVerificationMonitorMutationPromise = Promise.resolve();
+let outlookVerificationMonitorPumpPromise = null;
+let outlookVerificationMonitorScanPromise = null;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await chrome.storage.local.get(["apiBase"]);
@@ -58,6 +65,9 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.runtime.onStartup?.addListener(() => {
   enforceRuntimeGptWorkerLimit().catch((error) => {
     console.warn("[AutoBid GPT Pool] Could not trim legacy worker tabs at startup", error);
+  });
+  resumeOutlookVerificationMonitors().catch((error) => {
+    console.warn("[AutoBid Outlook] Could not resume verification monitors", error);
   });
 });
 
@@ -181,10 +191,12 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== "complete") return;
   retryCompletedRuntimeGptDeliveriesForTab(tabId).catch(() => {});
+  processOutlookVerificationMonitors().catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   backgroundAutomationHolds.delete(tabId);
+  removeOutlookVerificationMonitorsForTab(tabId).catch(() => {});
   handleRuntimeGptBatchTabRemoved(tabId).catch((error) => {
     console.warn("[AutoBid Batch] Could not recover a closed ChatGPT batch tab", error);
   });
@@ -192,6 +204,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   const name = String(alarm?.name || "");
+  if (name === OUTLOOK_VERIFICATION_ALARM) {
+    ensureOutlookVerificationMonitorPump().catch((error) => {
+      console.warn("[AutoBid Outlook] Scheduled verification scan failed", error);
+    });
+    return;
+  }
   if (!name.startsWith(RUNTIME_GPT_DELIVERY_ALARM_PREFIX)) return;
   const requestId = name.slice(RUNTIME_GPT_DELIVERY_ALARM_PREFIX.length);
   ensureRuntimeGptRequestsLoaded()
@@ -261,13 +279,17 @@ async function handleMessage(message, sender) {
     case "OUTLOOK_CONNECT":
       return connectOutlook();
     case "OUTLOOK_DISCONNECT":
-      return disconnectOutlook();
+      return disconnectOutlook(message.payload || {});
     case "OUTLOOK_LIST_VERIFICATION":
       return listOutlookVerificationMessages(message.payload || {});
     case "OUTLOOK_FIND_VERIFICATION":
       return findOutlookVerificationCode(message.payload || {});
     case "OUTLOOK_MARK_READ":
       return markOutlookMessageRead(message.payload || {});
+    case "OUTLOOK_MONITOR_START":
+      return startOutlookVerificationMonitor(message.payload || {}, sender);
+    case "OUTLOOK_MONITOR_ARM":
+      return armOutlookVerificationMonitor(message.payload || {}, sender);
     case "DEV_SESSION":
       return ensureDevSession();
     case "SAVE_SETTINGS":
@@ -447,14 +469,22 @@ function normalizeExecutionSummary(value) {
 }
 
 async function getOutlookStatus() {
-  return apiFetch("/outlook/connection");
+  const connection = await apiFetch("/outlook/connection");
+  return {
+    ...connection,
+    redirect_uri: chrome.identity.getRedirectURL("outlook")
+  };
 }
 
 async function connectOutlook() {
+  const settings = await getSettings();
   const redirectUri = chrome.identity.getRedirectURL("outlook");
   const authorization = await apiFetch("/outlook/oauth/start", {
     method: "POST",
-    body: { redirect_uri: redirectUri }
+    body: {
+      redirect_uri: redirectUri,
+      profile_id: settings.selectedProfileId || null
+    }
   });
   if (!authorization?.authorization_url) throw new Error("Auto Bid server did not return a Microsoft authorization URL");
 
@@ -471,20 +501,29 @@ async function connectOutlook() {
   const state = callback.searchParams.get("state");
   if (!code || !state) throw new Error("Microsoft sign-in did not return the expected authorization response");
 
-  return apiFetch("/outlook/oauth/callback", {
+  await apiFetch("/outlook/oauth/callback", {
     method: "POST",
     body: { code, state, redirect_uri: redirectUri }
   });
+  return getOutlookStatus();
 }
 
-async function disconnectOutlook() {
-  return apiFetch("/outlook/connection", { method: "DELETE" });
+async function disconnectOutlook(payload = {}) {
+  const connectionId = String(payload.connection_id || payload.connectionId || "");
+  const params = new URLSearchParams();
+  if (connectionId) params.set("connection_id", connectionId);
+  return apiFetch(`/outlook/connection${params.size ? `?${params}` : ""}`, { method: "DELETE" });
 }
 
 async function listOutlookVerificationMessages(payload = {}) {
   const params = new URLSearchParams();
   params.set("top", String(Math.min(40, Math.max(1, Number(payload.top || 20)))));
   if (payload.domain) params.set("domain", String(payload.domain));
+  if (payload.since) params.set("since", String(payload.since));
+  if (payload.title) params.set("title", String(payload.title).slice(0, 500));
+  if (payload.page_url || payload.pageUrl) params.set("page_url", String(payload.page_url || payload.pageUrl).slice(0, 4000));
+  if (payload.profile_id || payload.profileId) params.set("profile_id", String(payload.profile_id || payload.profileId));
+  if (payload.mailbox_email || payload.mailboxEmail) params.set("mailbox_email", String(payload.mailbox_email || payload.mailboxEmail));
   return apiFetch(`/outlook/messages?${params}`);
 }
 
@@ -492,13 +531,406 @@ async function findOutlookVerificationCode(payload = {}) {
   const params = new URLSearchParams();
   params.set("top", String(Math.min(10, Math.max(1, Number(payload.top || 10)))));
   if (payload.domain) params.set("domain", String(payload.domain));
+  if (payload.since) params.set("since", String(payload.since));
+  if (payload.title) params.set("title", String(payload.title).slice(0, 500));
+  if (payload.page_url || payload.pageUrl) params.set("page_url", String(payload.page_url || payload.pageUrl).slice(0, 4000));
+  if (payload.profile_id || payload.profileId) params.set("profile_id", String(payload.profile_id || payload.profileId));
+  if (payload.mailbox_email || payload.mailboxEmail) params.set("mailbox_email", String(payload.mailbox_email || payload.mailboxEmail));
   return apiFetch(`/outlook/latest-code?${params}`);
 }
 
 async function markOutlookMessageRead(payload = {}) {
   const messageId = String(payload.messageId || payload.message_id || "");
   if (!messageId) throw new Error("Outlook message ID is required");
-  return apiFetch(`/outlook/messages/${encodeURIComponent(messageId)}/read`, { method: "POST" });
+  return apiFetch(`/outlook/messages/${encodeURIComponent(messageId)}/read`, {
+    method: "POST",
+    body: { connection_id: String(payload.connection_id || payload.connectionId || "") }
+  });
+}
+
+async function startOutlookVerificationMonitor(payload = {}, sender = {}) {
+  const tabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : null;
+  if (!Number.isInteger(tabId)) return { started: false, reason: "missing-tab" };
+
+  const connection = await getOutlookStatus();
+  if (!connection?.configured) {
+    return {
+      started: false,
+      reason: "not-configured",
+      missing: connection?.missing || [],
+      redirect_uri: connection?.redirect_uri || ""
+    };
+  }
+  if (!connection?.connected) {
+    return { started: false, reason: "not-connected", redirect_uri: connection?.redirect_uri || "" };
+  }
+
+  const profile = await getSelectedProfileStaticFields().catch(() => null);
+  const profileId = String(payload.profile_id || payload.profileId || profile?.profile_id || "");
+  const mailboxEmail = String(
+    payload.mailbox_email || payload.mailboxEmail || profile?.static_fields?.email || ""
+  ).trim().toLowerCase();
+  const connections = Array.isArray(connection.connections) ? connection.connections : [];
+  const matchingConnection = connections.find((item) => profileId && item.profile_id === profileId) ||
+    connections.find((item) => mailboxEmail && normalizeOutlookMailboxEmail(item.email) === mailboxEmail);
+  if (!matchingConnection) {
+    return {
+      started: false,
+      reason: "profile-mailbox-not-connected",
+      profile_id: profileId,
+      mailbox_email: mailboxEmail
+    };
+  }
+
+  const now = Date.now();
+  const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
+  const monitor = {
+    id: `abov_${now}_${Math.random().toString(36).slice(2, 10)}`,
+    tab_id: tabId,
+    frame_id: frameId,
+    run_id: String(payload.run_id || payload.runId || "").slice(0, 120),
+    profile_id: profileId,
+    mailbox_email: normalizeOutlookMailboxEmail(matchingConnection.email),
+    connection_id: matchingConnection.id,
+    page_url: String(payload.page_url || payload.pageUrl || sender?.tab?.url || "").slice(0, 4000),
+    title: String(payload.title || sender?.tab?.title || "").slice(0, 500),
+    domain: normalizeOutlookMonitorHost(payload.domain || payload.page_url || payload.pageUrl || sender?.tab?.url || ""),
+    since: normalizeOutlookMonitorSince(payload.since, now),
+    created_at: now,
+    expires_at: now + OUTLOOK_VERIFICATION_MONITOR_TTL_MS,
+    armed: false,
+    delivery_attempts: 0,
+    last_message_id: ""
+  };
+
+  let replaced = [];
+  await mutateOutlookVerificationMonitors((monitors) => {
+    replaced = monitors.filter((item) => item.tab_id === tabId && item.frame_id === frameId);
+    const retained = monitors.filter((item) => item.tab_id !== tabId || item.frame_id !== frameId);
+    retained.push(monitor);
+    return retained;
+  });
+  await Promise.all(replaced.map((item) =>
+    releaseBackgroundTabAutomation(item.tab_id, `outlook-verification:${item.id}`).catch(() => {})
+  ));
+  await holdBackgroundTabAutomation(tabId, `outlook-verification:${monitor.id}`).catch(() => {});
+  return { started: true, monitor_id: monitor.id, expires_at: monitor.expires_at };
+}
+
+async function armOutlookVerificationMonitor(payload = {}, sender = {}) {
+  const monitorId = String(payload.monitor_id || payload.monitorId || "");
+  const senderTabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : null;
+  let armedMonitor = null;
+  await mutateOutlookVerificationMonitors((monitors) => monitors.map((monitor) => {
+    if (monitor.id !== monitorId || (senderTabId !== null && monitor.tab_id !== senderTabId)) return monitor;
+    armedMonitor = { ...monitor, armed: true, armed_at: Date.now() };
+    return armedMonitor;
+  }));
+  if (!armedMonitor) return { armed: false, reason: "monitor-not-found" };
+  await scheduleOutlookVerificationAlarm();
+  ensureOutlookVerificationMonitorPump().catch((error) => {
+    console.warn("[AutoBid Outlook] Verification monitor failed", {
+      monitor_id: monitorId,
+      error: error.message || String(error)
+    });
+  });
+  return { armed: true, monitor_id: monitorId, expires_at: armedMonitor.expires_at };
+}
+
+async function resumeOutlookVerificationMonitors() {
+  const monitors = await getOutlookVerificationMonitors();
+  if (!monitors.some((monitor) => monitor.armed && monitor.expires_at > Date.now())) return { resumed: false };
+  await scheduleOutlookVerificationAlarm();
+  ensureOutlookVerificationMonitorPump().catch(() => {});
+  return { resumed: true };
+}
+
+async function ensureOutlookVerificationMonitorPump() {
+  if (outlookVerificationMonitorPumpPromise) return outlookVerificationMonitorPumpPromise;
+  outlookVerificationMonitorPumpPromise = (async () => {
+    while (true) {
+      const active = (await getOutlookVerificationMonitors())
+        .filter((monitor) => monitor.armed && monitor.expires_at > Date.now());
+      if (active.length === 0) break;
+      await processOutlookVerificationMonitors().catch((error) => {
+        console.warn("[AutoBid Outlook] Inbox verification scan failed", error);
+      });
+      const remaining = (await getOutlookVerificationMonitors())
+        .some((monitor) => monitor.armed && monitor.expires_at > Date.now());
+      if (!remaining) break;
+      await sleep(OUTLOOK_VERIFICATION_POLL_MS);
+    }
+  })().finally(() => {
+    outlookVerificationMonitorPumpPromise = null;
+    getOutlookVerificationMonitors().then((monitors) => {
+      if (!monitors.some((monitor) => monitor.armed && monitor.expires_at > Date.now())) {
+        return chrome.alarms?.clear?.(OUTLOOK_VERIFICATION_ALARM);
+      }
+      return null;
+    }).catch(() => {});
+  });
+  return outlookVerificationMonitorPumpPromise;
+}
+
+async function processOutlookVerificationMonitors() {
+  if (outlookVerificationMonitorScanPromise) return outlookVerificationMonitorScanPromise;
+  outlookVerificationMonitorScanPromise = performOutlookVerificationMonitorScan()
+    .finally(() => {
+      outlookVerificationMonitorScanPromise = null;
+    });
+  return outlookVerificationMonitorScanPromise;
+}
+
+async function performOutlookVerificationMonitorScan() {
+  const now = Date.now();
+  let expired = [];
+  let monitors = [];
+  await mutateOutlookVerificationMonitors((current) => {
+    expired = current.filter((monitor) => monitor.expires_at <= now);
+    monitors = current.filter((monitor) => monitor.expires_at > now);
+    return monitors;
+  });
+  await Promise.all(expired.map((monitor) =>
+    releaseBackgroundTabAutomation(monitor.tab_id, `outlook-verification:${monitor.id}`).catch(() => {})
+  ));
+
+  const armed = monitors.filter((monitor) => monitor.armed);
+  if (armed.length === 0) return { processed: 0, delivered: 0 };
+
+  const since = new Date(Math.min(...armed.map((monitor) => monitor.since))).toISOString();
+  const result = await listOutlookVerificationMessages({ top: 40, since });
+  const messages = (Array.isArray(result?.messages) ? result.messages : [])
+    .filter((message) => Array.isArray(message.codes) && message.codes.length > 0)
+    .sort((left, right) => Date.parse(right.received_at || 0) - Date.parse(left.received_at || 0));
+  const claimedMessageIds = new Set();
+  let delivered = 0;
+
+  for (const message of messages) {
+    if (!message?.id || claimedMessageIds.has(message.id)) continue;
+    const eligible = armed.filter((monitor) =>
+      outlookMessageMatchesMonitorMailbox(message, monitor) &&
+      Date.parse(message.received_at || 0) >= monitor.since - 30_000 &&
+      (monitor.last_message_id !== message.id || Number(monitor.delivery_attempts || 0) < 3)
+    );
+    const monitor = chooseOutlookVerificationMonitor(message, eligible);
+    if (!monitor) continue;
+    claimedMessageIds.add(message.id);
+    const delivery = await deliverOutlookVerificationMessage(monitor, message);
+    await updateOutlookMonitorDeliveryAttempt(monitor.id, message.id);
+    if (!delivery?.settled && !delivery?.applied) continue;
+
+    await removeOutlookVerificationMonitor(monitor.id);
+    await releaseBackgroundTabAutomation(monitor.tab_id, `outlook-verification:${monitor.id}`).catch(() => {});
+    if (delivery?.applied) {
+      delivered += 1;
+      markOutlookMessageRead({ messageId: message.id, connection_id: message.connection_id }).catch(() => {});
+    }
+    console.info("[AutoBid Outlook] Verification completed", {
+      monitor_id: monitor.id,
+      tab_id: monitor.tab_id,
+      message_id: message.id,
+      clicked: Boolean(delivery.clicked)
+    });
+  }
+
+  return { processed: armed.length, delivered };
+}
+
+function chooseOutlookVerificationMonitor(message, monitors) {
+  if (monitors.length === 0) return null;
+  if (monitors.length === 1) {
+    return scoreOutlookMessageForMonitor(message, monitors[0]) > 0 ? monitors[0] : null;
+  }
+  const ranked = monitors
+    .map((monitor) => ({ monitor, score: scoreOutlookMessageForMonitor(message, monitor) }))
+    .sort((left, right) => right.score - left.score || right.monitor.since - left.monitor.since);
+  if (ranked[0].score <= 0 || ranked[0].score === ranked[1]?.score) {
+    console.warn("[AutoBid Outlook] Ambiguous verification email was not assigned", {
+      message_id: message.id,
+      candidate_monitors: ranked.length,
+      best_score: ranked[0].score
+    });
+    return null;
+  }
+  return ranked[0].monitor;
+}
+
+function outlookMessageMatchesMonitorMailbox(message, monitor) {
+  const messageConnectionId = String(message?.connection_id || "");
+  const monitorConnectionId = String(monitor?.connection_id || "");
+  if (messageConnectionId && monitorConnectionId) return messageConnectionId === monitorConnectionId;
+  const messageEmail = normalizeOutlookMailboxEmail(message?.mailbox_email);
+  return Boolean(messageEmail && messageEmail === normalizeOutlookMailboxEmail(monitor?.mailbox_email));
+}
+
+function normalizeOutlookMailboxEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function scoreOutlookMessageForMonitor(message, monitor) {
+  const text = normalizeOutlookMonitorText([
+    message.subject,
+    message.preview,
+    message.from?.name,
+    message.from?.address
+  ].filter(Boolean).join(" "));
+  const context = getOutlookMonitorContext(monitor);
+  let score = 0;
+  for (const token of context.providerTokens) if (text.includes(token)) score += 6;
+  for (const token of context.companyTokens) if (text.includes(token)) score += 12;
+  for (const token of context.titleTokens) if (text.includes(token)) score += 2;
+  return score;
+}
+
+function getOutlookMonitorContext(monitor) {
+  let url = null;
+  try {
+    url = new URL(monitor.page_url || "");
+  } catch (_error) {
+    // Domain-only context still works when a page URL cannot be parsed.
+  }
+  const domain = normalizeOutlookMonitorHost(monitor.domain || url?.hostname || "");
+  const providerTokens = new Set(domain.split(".").map(normalizeOutlookMonitorToken).filter((token) => token.length >= 4));
+  const companyTokens = new Set();
+  const pathParts = (url?.pathname || "").split("/").map(normalizeOutlookMonitorToken).filter(Boolean);
+  if (/greenhouse\.io$/.test(domain)) {
+    providerTokens.add("greenhouse");
+    if (pathParts[0] && !/^(jobs?|applications?)$/.test(pathParts[0])) companyTokens.add(pathParts[0]);
+  } else if (/ashbyhq\.com$/.test(domain)) {
+    providerTokens.add("ashby");
+    if (pathParts[0]) companyTokens.add(pathParts[0]);
+  } else if (/teamtailor\.com$/.test(domain)) {
+    providerTokens.add("teamtailor");
+    const subdomain = normalizeOutlookMonitorToken(domain.split(".")[0]);
+    if (subdomain && subdomain !== "www") companyTokens.add(subdomain);
+  } else if (/workable\.com$/.test(domain)) {
+    providerTokens.add("workable");
+  } else if (/bamboohr\.com$/.test(domain)) {
+    providerTokens.add("bamboohr");
+    const subdomain = normalizeOutlookMonitorToken(domain.split(".")[0]);
+    if (subdomain && subdomain !== "www") companyTokens.add(subdomain);
+  }
+  const ignored = new Set(["application", "apply", "career", "careers", "engineer", "engineering", "jobs", "position", "role", "senior", "software"]);
+  const titleTokens = normalizeOutlookMonitorText(monitor.title).split(" ")
+    .map(normalizeOutlookMonitorToken)
+    .filter((token) => token.length >= 4 && !ignored.has(token))
+    .slice(0, 12);
+  return { providerTokens: [...providerTokens], companyTokens: [...companyTokens], titleTokens };
+}
+
+async function deliverOutlookVerificationMessage(monitor, message) {
+  const payload = {
+    monitor_id: monitor.id,
+    code: String(message.codes?.[0] || ""),
+    message: {
+      id: String(message.id || ""),
+      connection_id: String(message.connection_id || ""),
+      mailbox_email: normalizeOutlookMailboxEmail(message.mailbox_email),
+      subject: String(message.subject || ""),
+      received_at: message.received_at || null
+    }
+  };
+  const sendToContent = async (frameId = monitor.frame_id) => chrome.tabs.sendMessage(
+    monitor.tab_id,
+    { type: "AUTO_BID_OUTLOOK_VERIFICATION_READY", payload },
+    { frameId }
+  );
+
+  try {
+    const response = await sendToContent();
+    if (response?.ok) return response;
+  } catch (_error) {
+    // Navigation replaces programmatically injected scripts; restore them below.
+  }
+
+  try {
+    await injectAutoBidScripts(monitor.tab_id);
+    await sleep(200);
+    const response = await sendToContent(monitor.frame_id).catch(() =>
+      monitor.frame_id === 0 ? null : sendToContent(0)
+    );
+    return response?.ok ? response : { applied: false, reason: response?.reason || "verification-field-not-ready" };
+  } catch (error) {
+    return { applied: false, reason: error.message || String(error) };
+  }
+}
+
+async function updateOutlookMonitorDeliveryAttempt(monitorId, messageId) {
+  await mutateOutlookVerificationMonitors((monitors) => monitors.map((monitor) =>
+    monitor.id === monitorId
+      ? {
+        ...monitor,
+        delivery_attempts: monitor.last_message_id === messageId
+          ? Number(monitor.delivery_attempts || 0) + 1
+          : 1,
+        last_message_id: messageId,
+        last_delivery_at: Date.now()
+      }
+      : monitor
+  ));
+}
+
+async function removeOutlookVerificationMonitor(monitorId) {
+  await mutateOutlookVerificationMonitors((monitors) => monitors.filter((monitor) => monitor.id !== monitorId));
+}
+
+async function removeOutlookVerificationMonitorsForTab(tabId) {
+  const removed = [];
+  await mutateOutlookVerificationMonitors((monitors) => monitors.filter((monitor) => {
+    if (monitor.tab_id !== tabId) return true;
+    removed.push(monitor);
+    return false;
+  }));
+  await Promise.all(removed.map((monitor) =>
+    releaseBackgroundTabAutomation(tabId, `outlook-verification:${monitor.id}`).catch(() => {})
+  ));
+}
+
+async function getOutlookVerificationMonitors() {
+  const stored = await chrome.storage.local.get([OUTLOOK_VERIFICATION_MONITORS_STORAGE_KEY]).catch(() => ({}));
+  return Array.isArray(stored[OUTLOOK_VERIFICATION_MONITORS_STORAGE_KEY])
+    ? stored[OUTLOOK_VERIFICATION_MONITORS_STORAGE_KEY]
+    : [];
+}
+
+async function mutateOutlookVerificationMonitors(mutator) {
+  let result = [];
+  outlookVerificationMonitorMutationPromise = outlookVerificationMonitorMutationPromise
+    .catch(() => {})
+    .then(async () => {
+      const current = await getOutlookVerificationMonitors();
+      result = await mutator(current.map((monitor) => ({ ...monitor })));
+      if (!Array.isArray(result)) result = current;
+      await chrome.storage.local.set({ [OUTLOOK_VERIFICATION_MONITORS_STORAGE_KEY]: result });
+    });
+  await outlookVerificationMonitorMutationPromise;
+  return result;
+}
+
+async function scheduleOutlookVerificationAlarm() {
+  if (!chrome.alarms?.create) return;
+  await chrome.alarms.create(OUTLOOK_VERIFICATION_ALARM, { periodInMinutes: 0.5 });
+}
+
+function normalizeOutlookMonitorHost(value) {
+  try {
+    return new URL(String(value || "")).hostname.toLowerCase().replace(/^www\./, "");
+  } catch (_error) {
+    return String(value || "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[/:]/)[0];
+  }
+}
+
+function normalizeOutlookMonitorSince(value, fallback = Date.now()) {
+  const parsed = typeof value === "number" ? value : Date.parse(String(value || ""));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeOutlookMonitorText(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9.]+/g, " ").trim();
+}
+
+function normalizeOutlookMonitorToken(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 async function triggerAutoBidFromSender(sender) {

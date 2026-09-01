@@ -17,11 +17,60 @@ export function isOutlookConfigured() {
   return Boolean(MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
 }
 
-export function createOutlookAuthorization({ userId, redirectUri }) {
+export function getOutlookConfiguration() {
+  const missing = [];
+  if (!MICROSOFT_CLIENT_ID) missing.push("MICROSOFT_CLIENT_ID");
+  if (!MICROSOFT_CLIENT_SECRET) missing.push("MICROSOFT_CLIENT_SECRET");
+  return {
+    configured: missing.length === 0,
+    missing,
+    tenant_id: MICROSOFT_TENANT_ID,
+    scopes: [...MICROSOFT_OUTLOOK_SCOPES]
+  };
+}
+
+async function resolveOutlookMailboxes(pool, userId, options = {}) {
+  const clauses = ["user_id = $1", "active = true"];
+  const values = [userId];
+  const connectionId = normalizeIdentifier(options.connectionId || options.connection_id);
+  const profileId = normalizeIdentifier(options.profileId || options.profile_id);
+  const mailboxEmail = normalizeEmailAddress(options.mailboxEmail || options.mailbox_email);
+  if (connectionId) {
+    values.push(connectionId);
+    clauses.push(`id = $${values.length}`);
+  } else if (profileId) {
+    values.push(profileId);
+    clauses.push(`profile_id = $${values.length}`);
+  } else if (mailboxEmail) {
+    values.push(mailboxEmail);
+    clauses.push(`lower(email) = $${values.length}`);
+  }
+  const { rows } = await pool.query(
+    `select * from auto_bid_outlook_mailboxes
+      where ${clauses.join(" and ")}
+      order by updated_at desc`,
+    values
+  );
+  return rows;
+}
+
+async function validateProfileBinding(pool, userId, profileId) {
+  const normalized = normalizeIdentifier(profileId);
+  if (!normalized) return null;
+  const { rows } = await pool.query(
+    "select id from auto_bid_profiles where id = $1 and user_id = $2 and active = true limit 1",
+    [normalized, userId]
+  );
+  if (!rows[0]) throw httpError(400, "The selected Auto Bid profile is no longer available");
+  return rows[0].id;
+}
+
+export function createOutlookAuthorization({ userId, redirectUri, profileId }) {
   ensureConfigured();
   const normalizedRedirect = validateRedirectUri(redirectUri);
   const state = signState({
     sub: userId,
+    profile_id: normalizeIdentifier(profileId),
     redirect_uri: normalizedRedirect,
     nonce: crypto.randomBytes(18).toString("base64url"),
     exp: Date.now() + OAUTH_STATE_TTL_MS
@@ -59,56 +108,115 @@ export async function completeOutlookAuthorization(pool, { userId, code, state, 
   if (!token.refresh_token) throw httpError(502, "Microsoft did not return a refresh token; reconnect and grant offline access");
   const profile = await graphFetchWithToken(token.access_token, "/me?$select=id,displayName,mail,userPrincipalName");
   const expiresAt = new Date(Date.now() + Math.max(60, Number(token.expires_in || 3600)) * 1000);
-
-  const { rows } = await pool.query(
-    `insert into auto_bid_outlook_connections
-      (user_id, microsoft_user_id, tenant_id, email, display_name, access_token_encrypted,
-       refresh_token_encrypted, token_expires_at, scopes, active, updated_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, now())
-     on conflict (user_id) do update set
-       microsoft_user_id = excluded.microsoft_user_id,
-       tenant_id = excluded.tenant_id,
-       email = excluded.email,
-       display_name = excluded.display_name,
-       access_token_encrypted = excluded.access_token_encrypted,
-       refresh_token_encrypted = excluded.refresh_token_encrypted,
-       token_expires_at = excluded.token_expires_at,
-       scopes = excluded.scopes,
-       active = true,
-       updated_at = now()
-     returning *`,
-    [
-      userId,
-      profile.id,
-      tokenTenantId(token.id_token),
-      profile.mail || profile.userPrincipalName || "",
-      profile.displayName || "",
-      encryptSecret(token.access_token),
-      encryptSecret(token.refresh_token),
-      expiresAt,
-      normalizeScopes(token.scope || MICROSOFT_OUTLOOK_SCOPES)
-    ]
-  );
+  const profileId = await validateProfileBinding(pool, userId, statePayload.profile_id);
+  const microsoftUserId = String(profile.id || "");
+  const values = [
+    userId,
+    profileId,
+    microsoftUserId,
+    tokenTenantId(token.id_token),
+    profile.mail || profile.userPrincipalName || "",
+    profile.displayName || "",
+    encryptSecret(token.access_token),
+    encryptSecret(token.refresh_token),
+    expiresAt,
+    normalizeScopes(token.scope || MICROSOFT_OUTLOOK_SCOPES)
+  ];
+  const existing = profileId
+    ? await pool.query(
+      `select id from auto_bid_outlook_mailboxes
+        where user_id = $1
+          and (profile_id = $2 or (profile_id is null and microsoft_user_id = $3))
+        order by case when profile_id = $2 then 0 else 1 end
+        limit 1`,
+      [userId, profileId, microsoftUserId]
+    )
+    : await pool.query(
+      `select id from auto_bid_outlook_mailboxes
+        where user_id = $1 and microsoft_user_id = $2 and profile_id is null
+        limit 1`,
+      [userId, microsoftUserId]
+    );
+  let rows;
+  if (existing.rows[0]?.id) {
+    ({ rows } = await pool.query(
+      `update auto_bid_outlook_mailboxes
+        set profile_id = $2,
+            microsoft_user_id = $3,
+            tenant_id = $4,
+            email = $5,
+            display_name = $6,
+            access_token_encrypted = $7,
+            refresh_token_encrypted = $8,
+            token_expires_at = $9,
+            scopes = $10,
+            active = true,
+            updated_at = now()
+        where id = $11 and user_id = $1
+        returning *`,
+      [...values, existing.rows[0].id]
+    ));
+  } else {
+    ({ rows } = await pool.query(
+      `insert into auto_bid_outlook_mailboxes
+        (id, user_id, profile_id, microsoft_user_id, tenant_id, email, display_name,
+         access_token_encrypted, refresh_token_encrypted, token_expires_at, scopes, active, updated_at)
+       values ($11, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, now())
+       returning *`,
+      [...values, createMailboxId()]
+    ));
+  }
   return serializeConnection(rows[0]);
 }
 
 export async function getOutlookConnection(pool, userId) {
   const { rows } = await pool.query(
-    "select * from auto_bid_outlook_connections where user_id = $1 and active = true limit 1",
+    `select mailbox.*, profile.name as profile_name
+       from auto_bid_outlook_mailboxes mailbox
+       left join auto_bid_profiles profile on profile.id = mailbox.profile_id
+      where mailbox.user_id = $1 and mailbox.active = true
+      order by mailbox.updated_at desc`,
     [userId]
   );
-  return rows[0] ? serializeConnection(rows[0]) : { connected: false, configured: isOutlookConfigured() };
+  const connections = rows.map(serializeConnection);
+  return {
+    connected: connections.length > 0,
+    ...getOutlookConfiguration(),
+    connections,
+    connection_count: connections.length,
+    ...(connections[0] || {})
+  };
 }
 
-export async function disconnectOutlook(pool, userId) {
-  await pool.query("delete from auto_bid_outlook_connections where user_id = $1", [userId]);
-  return { connected: false, configured: isOutlookConfigured() };
+export async function disconnectOutlook(pool, userId, connectionId = "") {
+  if (connectionId) {
+    const { rows } = await pool.query(
+      "delete from auto_bid_outlook_mailboxes where id = $1 and user_id = $2 returning microsoft_user_id",
+      [connectionId, userId]
+    );
+    if (rows[0]?.microsoft_user_id) {
+      await pool.query(
+        "delete from auto_bid_outlook_connections where user_id = $1 and microsoft_user_id = $2",
+        [userId, rows[0].microsoft_user_id]
+      );
+    }
+  } else {
+    await pool.query("delete from auto_bid_outlook_mailboxes where user_id = $1", [userId]);
+    await pool.query("delete from auto_bid_outlook_connections where user_id = $1", [userId]);
+  }
+  return getOutlookConnection(pool, userId);
 }
 
 export async function listVerificationMessages(pool, userId, options = {}) {
   const top = Math.min(40, Math.max(1, Number(options.top || 20)));
-  const domain = normalizeHost(options.domain || "");
-  const accessToken = await getValidAccessToken(pool, userId);
+  const context = buildVerificationContext(options);
+  const connections = await resolveOutlookMailboxes(pool, userId, options);
+  if (connections.length === 0) {
+    const requestedEmail = normalizeEmailAddress(options.mailboxEmail || options.mailbox_email || "");
+    throw httpError(409, requestedEmail
+      ? `Connect the Outlook mailbox ${requestedEmail} to this Auto Bid profile first`
+      : "Connect an Outlook mailbox in Auto Bid first");
+  }
   const listTop = Math.min(50, Math.max(25, top * 2));
   const query = new URLSearchParams({
     "$top": String(listTop),
@@ -116,64 +224,104 @@ export async function listVerificationMessages(pool, userId, options = {}) {
     "$orderby": "receivedDateTime desc"
   });
   const headers = { Prefer: 'IdType="ImmutableId", outlook.body-content-type="text"' };
-  const folders = await Promise.all(["inbox", "junkemail"].map(async (folder) => {
+  const mailboxResults = await Promise.all(connections.map(async (connection) => {
     try {
-      const result = await graphFetch(pool, userId, `/me/mailFolders/${folder}/messages?${query}`, { headers, accessToken });
-      return (result.value || []).map((message) => ({ ...message, folder }));
+      const accessToken = await getValidAccessToken(pool, connection);
+      const folders = await Promise.all(["inbox", "junkemail"].map(async (folder) => {
+        try {
+          const result = await graphFetch(pool, connection, `/me/mailFolders/${folder}/messages?${query}`, { headers, accessToken });
+          return (result.value || []).map((message) => ({ ...message, folder }));
+        } catch (error) {
+          if (folder === "junkemail") return [];
+          throw error;
+        }
+      }));
+      return { connection, messages: folders.flat(), error: null };
     } catch (error) {
-      if (folder === "junkemail") return [];
-      throw error;
+      return { connection, messages: [], error };
     }
   }));
+  const successful = mailboxResults.filter((result) => !result.error);
+  if (successful.length === 0) throw mailboxResults[0]?.error || httpError(502, "Outlook mailbox scan failed");
 
-  const cutoff = Date.now() - MESSAGE_LOOKBACK_MS;
-  const candidates = folders.flat()
-    .filter((message) => new Date(message.receivedDateTime || 0).getTime() >= cutoff)
-    .map((message) => ({ message, score: scoreVerificationMessage(message, domain) }))
+  const requestedSince = normalizeSinceTime(options.since);
+  const cutoff = Math.max(
+    Date.now() - MESSAGE_LOOKBACK_MS,
+    requestedSince ? requestedSince - 30_000 : 0
+  );
+  const candidates = successful.flatMap(({ connection, messages }) => messages.map((message) => ({ connection, message })))
+    .filter(({ message }) => new Date(message.receivedDateTime || 0).getTime() >= cutoff)
+    .map(({ connection, message }) => ({
+      connection,
+      message,
+      score: scoreVerificationMessage(message, context),
+      contextScore: scoreVerificationContext(message, context)
+    }))
     .filter((item) => item.score >= 5)
-    .sort((left, right) => right.score - left.score || new Date(right.message.receivedDateTime) - new Date(left.message.receivedDateTime))
+    .sort((left, right) =>
+      right.contextScore - left.contextScore ||
+      right.score - left.score ||
+      new Date(right.message.receivedDateTime) - new Date(left.message.receivedDateTime)
+    )
     .slice(0, top);
 
-  const detailed = await Promise.all(candidates.map(async ({ message, score }) => {
+  const detailed = await Promise.all(candidates.map(async ({ connection, message, score, contextScore }) => {
     try {
-      const detail = await graphFetch(pool, userId, `/me/messages/${encodeURIComponent(message.id)}?$select=id,subject,from,receivedDateTime,isRead,bodyPreview,body,webLink,categories`, {
+      const detail = await graphFetch(pool, connection, `/me/messages/${encodeURIComponent(message.id)}?$select=id,subject,from,receivedDateTime,isRead,bodyPreview,body,webLink,categories`, {
         headers,
-        accessToken
+        accessToken: await getValidAccessToken(pool, connection)
       });
-      return serializeMessage({ ...message, ...detail }, score);
+      return serializeMessage({ ...message, ...detail }, score, contextScore, connection);
     } catch (_error) {
-      return serializeMessage(message, score);
+      return serializeMessage(message, score, contextScore, connection);
     }
   }));
 
-  return { messages: detailed, scanned: folders.flat().length };
+  return {
+    messages: detailed,
+    scanned: successful.reduce((count, result) => count + result.messages.length, 0),
+    mailboxes_scanned: successful.length,
+    mailbox_errors: mailboxResults.filter((result) => result.error).map((result) => ({
+      connection_id: result.connection.id,
+      mailbox_email: result.connection.email || "",
+      message: result.error.message || String(result.error)
+    }))
+  };
 }
 
-export async function markOutlookMessageRead(pool, userId, messageId) {
+export async function markOutlookMessageRead(pool, userId, messageId, connectionId = "") {
   if (!messageId) throw httpError(400, "Outlook message ID is required");
-  await graphFetch(pool, userId, `/me/messages/${encodeURIComponent(messageId)}`, {
+  const connections = await resolveOutlookMailboxes(pool, userId, { connectionId });
+  if (!connectionId && connections.length > 1) {
+    throw httpError(400, "Outlook connection ID is required when more than one mailbox is connected");
+  }
+  const [connection] = connections;
+  if (!connection) throw httpError(409, "The Outlook mailbox for this verification message is no longer connected");
+  await graphFetch(pool, connection, `/me/messages/${encodeURIComponent(messageId)}`, {
     method: "PATCH",
     body: { isRead: true }
   });
-  return { id: messageId, is_read: true };
+  return { id: messageId, connection_id: connection.id, is_read: true };
 }
 
 export async function findLatestVerificationCode(pool, userId, options = {}) {
   const result = await listVerificationMessages(pool, userId, { ...options, top: Math.min(10, Number(options.top || 10)) });
-  const message = result.messages.find((item) => item.codes?.length);
+  const matches = result.messages.filter((item) => item.codes?.length);
+  const message = matches[0] || null;
+  const runnerUp = matches[1] || null;
+  const ambiguous = Boolean(
+    message && runnerUp &&
+    Number(message.context_score || 0) === Number(runnerUp.context_score || 0)
+  );
   return {
-    code: message?.codes?.[0] || "",
-    message: message || null
+    code: ambiguous ? "" : message?.codes?.[0] || "",
+    message: ambiguous ? null : message,
+    reason: ambiguous ? "ambiguous" : message ? "matched" : "not-found"
   };
 }
 
-async function getValidAccessToken(pool, userId) {
+async function getValidAccessToken(pool, connection) {
   ensureConfigured();
-  const { rows } = await pool.query(
-    "select * from auto_bid_outlook_connections where user_id = $1 and active = true limit 1",
-    [userId]
-  );
-  const connection = rows[0];
   if (!connection) throw httpError(409, "Connect an Outlook mailbox in Auto Bid first");
   if (new Date(connection.token_expires_at).getTime() > Date.now() + TOKEN_REFRESH_MARGIN_MS) {
     return decryptSecret(connection.access_token_encrypted);
@@ -187,27 +335,27 @@ async function getValidAccessToken(pool, userId) {
   const refreshToken = token.refresh_token || decryptSecret(connection.refresh_token_encrypted);
   const expiresAt = new Date(Date.now() + Math.max(60, Number(token.expires_in || 3600)) * 1000);
   await pool.query(
-    `update auto_bid_outlook_connections
+    `update auto_bid_outlook_mailboxes
        set access_token_encrypted = $2,
            refresh_token_encrypted = $3,
            token_expires_at = $4,
            scopes = $5,
            updated_at = now()
-     where user_id = $1`,
-    [userId, encryptSecret(token.access_token), encryptSecret(refreshToken), expiresAt, normalizeScopes(token.scope || connection.scopes)]
+     where id = $1`,
+    [connection.id, encryptSecret(token.access_token), encryptSecret(refreshToken), expiresAt, normalizeScopes(token.scope || connection.scopes)]
   );
   return token.access_token;
 }
 
-async function graphFetch(pool, userId, path, options = {}) {
-  let accessToken = options.accessToken || await getValidAccessToken(pool, userId);
+async function graphFetch(pool, connection, path, options = {}) {
+  let accessToken = options.accessToken || await getValidAccessToken(pool, connection);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       return await graphFetchWithToken(accessToken, path, options);
     } catch (error) {
       if (error.status !== 401 || attempt > 0) throw error;
-      await pool.query("update auto_bid_outlook_connections set token_expires_at = now() where user_id = $1", [userId]);
-      accessToken = await getValidAccessToken(pool, userId);
+      await pool.query("update auto_bid_outlook_mailboxes set token_expires_at = now() where id = $1", [connection.id]);
+      accessToken = await getValidAccessToken(pool, { ...connection, token_expires_at: new Date(0) });
     }
   }
   throw httpError(502, "Microsoft Graph request failed");
@@ -257,7 +405,10 @@ function microsoftOAuthBase() {
 function serializeConnection(connection) {
   return {
     connected: true,
-    configured: isOutlookConfigured(),
+    ...getOutlookConfiguration(),
+    id: connection.id || "",
+    profile_id: connection.profile_id || null,
+    profile_name: connection.profile_name || "",
     email: connection.email || "",
     display_name: connection.display_name || "",
     microsoft_user_id: connection.microsoft_user_id || "",
@@ -267,11 +418,14 @@ function serializeConnection(connection) {
   };
 }
 
-function serializeMessage(message, score) {
+function serializeMessage(message, score, contextScore = 0, connection = {}) {
   const bodyText = stripHtml(message.body?.content || message.bodyPreview || "");
   const combined = `${message.subject || ""}\n${bodyText}`;
   return {
     id: message.id,
+    connection_id: connection.id || "",
+    mailbox_email: connection.email || "",
+    profile_id: connection.profile_id || null,
     subject: message.subject || "",
     from: {
       name: message.from?.emailAddress?.name || "",
@@ -284,11 +438,12 @@ function serializeMessage(message, score) {
     codes: extractVerificationCodes(combined),
     links: extractVerificationLinks(message.body?.content || ""),
     outlook_url: message.webLink || "",
-    score
+    score,
+    context_score: contextScore
   };
 }
 
-function scoreVerificationMessage(message, domain) {
+function scoreVerificationMessage(message, context) {
   const subject = normalizeText(message.subject);
   const preview = normalizeText(message.bodyPreview);
   const sender = normalizeText(`${message.from?.emailAddress?.name || ""} ${message.from?.emailAddress?.address || ""}`);
@@ -299,22 +454,120 @@ function scoreVerificationMessage(message, domain) {
   if (/\b(verify|verification|confirm|activate|code|otp|pin|passcode)\b/.test(preview)) score += 4;
   if (/\b(application|candidate|career|job|recruit|workday|greenhouse|lever|ashby|workable|successfactors)\b/.test(text)) score += 3;
   if (!message.isRead) score += 1;
-  if (domain && text.includes(domain.replace(/\./g, " "))) score += 6;
+  score += scoreVerificationContext(message, context);
   const ageHours = Math.max(0, (Date.now() - new Date(message.receivedDateTime || 0).getTime()) / 3_600_000);
   if (ageHours <= 1) score += 4;
   else if (ageHours <= 24) score += 2;
   return score;
 }
 
-function extractVerificationCodes(value) {
+function scoreVerificationContext(message, context = {}) {
+  const text = normalizeText([
+    message.subject,
+    message.bodyPreview,
+    message.from?.emailAddress?.name,
+    message.from?.emailAddress?.address
+  ].filter(Boolean).join(" "));
+  let score = 0;
+  for (const token of context.providerTokens || []) {
+    if (token && text.includes(token)) score += 6;
+  }
+  for (const token of context.companyTokens || []) {
+    if (token && text.includes(token)) score += 10;
+  }
+  let titleMatches = 0;
+  for (const token of context.titleTokens || []) {
+    if (token && text.includes(token)) titleMatches += 1;
+  }
+  return score + Math.min(6, titleMatches * 2);
+}
+
+function buildVerificationContext(options = {}) {
+  const pageUrl = safeUrl(options.pageUrl || options.page_url || "");
+  const domain = normalizeHost(options.domain || pageUrl?.hostname || "");
+  const pathParts = (pageUrl?.pathname || "").split("/").map(normalizeContextToken).filter(Boolean);
+  const providerTokens = new Set(domain.split(".").map(normalizeContextToken).filter((token) => token.length >= 4));
+  const companyTokens = new Set();
+
+  if (/greenhouse\.io$/.test(domain)) {
+    providerTokens.add("greenhouse");
+    if (pathParts[0] && !/^(jobs?|applications?)$/.test(pathParts[0])) companyTokens.add(pathParts[0]);
+  } else if (/ashbyhq\.com$/.test(domain)) {
+    providerTokens.add("ashby");
+    if (pathParts[0]) companyTokens.add(pathParts[0]);
+  } else if (/teamtailor\.com$/.test(domain)) {
+    providerTokens.add("teamtailor");
+    const subdomain = normalizeContextToken(domain.split(".")[0]);
+    if (subdomain && subdomain !== "www") companyTokens.add(subdomain);
+  } else if (/workable\.com$/.test(domain)) {
+    providerTokens.add("workable");
+  } else if (/bamboohr\.com$/.test(domain)) {
+    providerTokens.add("bamboohr");
+    const subdomain = normalizeContextToken(domain.split(".")[0]);
+    if (subdomain && subdomain !== "www") companyTokens.add(subdomain);
+  }
+
+  const titleTokens = tokenizeContext(options.title || "");
+  return {
+    domain,
+    providerTokens: Array.from(providerTokens),
+    companyTokens: Array.from(companyTokens),
+    titleTokens
+  };
+}
+
+function tokenizeContext(value) {
+  const ignored = new Set([
+    "application", "apply", "career", "careers", "company", "engineer", "engineering",
+    "jobs", "job", "position", "role", "senior", "software", "with", "your"
+  ]);
+  return normalizeText(value).split(" ")
+    .map(normalizeContextToken)
+    .filter((token) => token.length >= 4 && !ignored.has(token))
+    .slice(0, 12);
+}
+
+function normalizeContextToken(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
+}
+
+function normalizeSinceTime(value) {
+  if (!value) return 0;
+  const parsed = typeof value === "number" ? value : Date.parse(String(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function safeUrl(value) {
+  try {
+    return new URL(String(value || ""));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function createMailboxId() {
+  return `abo_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function normalizeIdentifier(value) {
+  return String(value || "").trim().slice(0, 160);
+}
+
+function normalizeEmailAddress(value) {
+  return String(value || "").trim().toLowerCase().slice(0, 320);
+}
+
+export function extractVerificationCodes(value) {
   const text = String(value || "");
   const codes = [];
-  const contextual = /(?:verification|security|confirmation|one[- ]time|otp|pin|passcode|code)(?:\s+(?:is|of))?[^a-z0-9]{0,16}([a-z0-9](?:[a-z0-9-]{2,10}[a-z0-9]))/gi;
+  const contextual = /(?:(?:verification|security|confirmation|one[- ]time|otp|pin|passcode)(?:\s+(?:code|pin|number))?|code)(?:\s+(?:is|of))?[^a-z0-9]{0,8}([a-z0-9](?:[a-z0-9-]{2,10}[a-z0-9]))/gi;
   for (const match of text.matchAll(contextual)) {
     const code = match[1].replace(/[^a-z0-9]/gi, "");
     if (/\d/.test(code) && code.length >= 4 && code.length <= 10) codes.push(code);
   }
-  for (const match of text.matchAll(/\b\d{6}\b/g)) codes.push(match[0]);
+  if (/\b(verify|verification|confirm|confirmation|security|one[- ]time|otp|pin|passcode|code)\b/i.test(text)) {
+    for (const match of text.matchAll(/\b\d{6}\b/g)) codes.push(match[0]);
+  }
   return Array.from(new Set(codes)).slice(0, 5);
 }
 

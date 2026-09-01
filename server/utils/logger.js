@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 const HTTP_LOG_META = Symbol("autoBidHttpLogMeta");
-const SENSITIVE_KEY = /(password|secret|token|authorization|cookie|api[_-]?key|private[_-]?key|client[_-]?secret)/i;
+const SENSITIVE_KEY = /(password|secret|token|authorization|cookie|api[_-]?key|private[_-]?key|client[_-]?secret|verification[_-]?code|passcode|^otp$|^codes?$)/i;
 const MAX_STRING_LENGTH = 600;
 const MAX_ARRAY_ITEMS = 30;
 const MAX_OBJECT_KEYS = 60;
